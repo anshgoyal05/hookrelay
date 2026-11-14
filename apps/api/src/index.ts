@@ -1,10 +1,29 @@
 import pg from "pg";
 import { Redis } from "ioredis";
-import amqp from "amqplib";
-import { loadConfig, createLogger } from "@hookrelay/shared";
+import { loadConfig, createLogger, AmqpConnectionManager } from "@hookrelay/shared";
 import { buildServer, type AmqpCheckable } from "./server.js";
+import type { Logger } from "pino";
 
 const logger = createLogger({ name: "hookrelay-api" });
+
+function createThrottledErrorHandler(log: Logger, clientName: string, throttleMs = 30_000) {
+  let lastLoggedAt = 0;
+  let suppressedCount = 0;
+
+  return (err: unknown) => {
+    const now = Date.now();
+    if (now - lastLoggedAt >= throttleMs) {
+      log.warn(
+        { err: (err as Error)?.message || err, suppressedCount, client: clientName },
+        `Redis connection error on ${clientName}${suppressedCount > 0 ? ` (${suppressedCount} duplicate errors suppressed)` : ""}`,
+      );
+      lastLoggedAt = now;
+      suppressedCount = 0;
+    } else {
+      suppressedCount++;
+    }
+  };
+}
 
 async function main(): Promise<void> {
   let config;
@@ -15,42 +34,41 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  logger.info({ nodeEnv: config.NODE_ENV, port: config.PORT }, "Initializing HookRelay API");
+  logger.info(
+    { nodeEnv: config.NODE_ENV, port: config.PORT, pid: process.pid },
+    "Initializing HookRelay API",
+  );
 
-  // 1. Initialize PostgreSQL pool
+  // 1. Initialize PostgreSQL pool with error listener on idle clients
   const pgPool = new pg.Pool({
     connectionString: config.DATABASE_URL,
   });
+  pgPool.on("error", (err) => {
+    logger.warn({ err: (err as Error)?.message }, "PostgreSQL pool client error");
+  });
 
-  // 2. Initialize Redis client
+  // 2. Initialize Redis client with throttled error logging (max 1 per 30s)
   const redisClient = new Redis(config.REDIS_URL, {
     lazyConnect: true,
     maxRetriesPerRequest: 1,
+    retryStrategy(times) {
+      return Math.min(times * 100, 2000);
+    },
   });
+  redisClient.on("error", createThrottledErrorHandler(logger, "api-redis", 30_000));
   await redisClient.connect().catch((err) => {
-    logger.warn({ err }, "Redis initial connection deferred/failed");
+    logger.warn({ err: (err as Error)?.message }, "Redis initial connection deferred/failed");
   });
 
-  // 3. Initialize RabbitMQ connection
-  let isAmqpReady = false;
-  let amqpConn: amqp.ChannelModel | null = null;
-  try {
-    amqpConn = await amqp.connect(config.RABBITMQ_URL);
-    isAmqpReady = true;
-    amqpConn.on("close", () => {
-      isAmqpReady = false;
-      logger.warn("RabbitMQ connection closed");
-    });
-    amqpConn.on("error", (err) => {
-      isAmqpReady = false;
-      logger.warn({ err }, "RabbitMQ connection error");
-    });
-  } catch (err) {
-    logger.warn({ err }, "RabbitMQ initial connection failed");
-  }
+  // 3. Initialize resilient RabbitMQ connection manager
+  const amqpManager = new AmqpConnectionManager({
+    url: config.RABBITMQ_URL,
+    logger,
+  });
+  await amqpManager.start();
 
   const amqpCheckable: AmqpCheckable = {
-    isConnected: () => isAmqpReady,
+    isConnected: () => amqpManager.isReady(),
   };
 
   const app = buildServer({
@@ -60,19 +78,26 @@ async function main(): Promise<void> {
     logger,
   });
 
-  // Graceful shutdown handling
+  // Graceful shutdown handling with 10s forced exit timeout
   const shutdown = async (signal: string) => {
-    logger.info({ signal }, "Shutting down API server gracefully");
+    logger.info({ signal, pid: process.pid }, "Shutting down API server gracefully");
+
+    const forceExitTimer = setTimeout(() => {
+      logger.fatal({ signal }, "Graceful shutdown timed out (10s), forcing process exit");
+      process.exit(1);
+    }, 10_000);
+    forceExitTimer.unref();
+
     try {
       await app.close();
-      await pgPool.end();
+      await pgPool.end().catch((err) => logger.warn({ err: (err as Error)?.message }, "Error closing pgPool"));
       await redisClient.quit().catch(() => {});
-      if (amqpConn) {
-        await amqpConn.close().catch(() => {});
-      }
+      await amqpManager.close().catch(() => {});
+      clearTimeout(forceExitTimer);
       logger.info("API server shutdown complete");
       process.exit(0);
     } catch (err) {
+      clearTimeout(forceExitTimer);
       logger.error({ err }, "Error during graceful shutdown");
       process.exit(1);
     }
@@ -83,7 +108,7 @@ async function main(): Promise<void> {
 
   try {
     await app.listen({ port: config.PORT, host: "0.0.0.0" });
-    logger.info({ port: config.PORT }, "HookRelay API listening");
+    logger.info({ port: config.PORT, pid: process.pid }, "HookRelay API listening");
   } catch (err) {
     logger.fatal({ err }, "Failed to start API server");
     process.exit(1);

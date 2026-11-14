@@ -29,6 +29,21 @@ export interface ApiDependencies {
   logger?: Logger;
 }
 
+async function withTimeout<T>(promise: Promise<T>, timeoutMs = 2000): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`Readiness check timed out after ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export function buildServer(dependencies: ApiDependencies) {
   const logger = dependencies.logger ?? createLogger({ name: "hookrelay-api" });
 
@@ -83,31 +98,35 @@ export function buildServer(dependencies: ApiDependencies) {
       rabbitmq: "down",
     };
 
-    // 1. Check PostgreSQL
+    // 1. Check PostgreSQL (with 2s timeout)
     try {
-      await dependencies.pgPool.query("SELECT 1");
+      await withTimeout(dependencies.pgPool.query("SELECT 1"), 2000);
       checks.postgres = "ok";
     } catch (err) {
-      request.log.warn({ err }, "Postgres readiness check failed");
+      request.log.warn({ err: (err as Error)?.message }, "Postgres readiness check failed");
     }
 
-    // 2. Check Redis
+    // 2. Check Redis (with 2s timeout)
     try {
-      const pong = await dependencies.redisClient.ping();
+      const pong = await withTimeout(dependencies.redisClient.ping(), 2000);
       if (pong === "PONG") {
         checks.redis = "ok";
       }
     } catch (err) {
-      request.log.warn({ err }, "Redis readiness check failed");
+      request.log.warn({ err: (err as Error)?.message }, "Redis readiness check failed");
     }
 
-    // 3. Check RabbitMQ
+    // 3. Check RabbitMQ (with 2s timeout)
     try {
-      if (dependencies.amqpConnection.isConnected()) {
+      const isConnected = await withTimeout(
+        Promise.resolve(dependencies.amqpConnection.isConnected()),
+        2000,
+      );
+      if (isConnected) {
         checks.rabbitmq = "ok";
       }
     } catch (err) {
-      request.log.warn({ err }, "RabbitMQ readiness check failed");
+      request.log.warn({ err: (err as Error)?.message }, "RabbitMQ readiness check failed");
     }
 
     const isAllReady =
