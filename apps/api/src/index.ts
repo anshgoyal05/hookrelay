@@ -71,11 +71,17 @@ async function main(): Promise<void> {
     isConnected: () => amqpManager.isReady(),
   };
 
+  if (!config.ADMIN_TOKEN || config.ADMIN_TOKEN.length < 32) {
+    logger.warn("ADMIN_TOKEN is not set or shorter than 32 characters. All /v1/admin/* endpoints are disabled.");
+  }
+
   const app = buildServer({
     pgPool,
     redisClient,
     amqpConnection: amqpCheckable,
     logger,
+    adminToken: config.ADMIN_TOKEN,
+    maxActiveKeys: config.MAX_ACTIVE_KEYS_PER_TENANT,
   });
 
   // Graceful shutdown handling with 10s forced exit timeout

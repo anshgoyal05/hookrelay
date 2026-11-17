@@ -21,6 +21,11 @@ export const ConfigSchema = z.object({
       required_error: "RABBITMQ_URL is required (e.g. amqp://guest:guest@localhost:5672)",
     })
     .min(1, "RABBITMQ_URL cannot be empty"),
+  ADMIN_TOKEN: z
+    .string()
+    .min(32, "ADMIN_TOKEN must be at least 32 characters if configured")
+    .optional(),
+  MAX_ACTIVE_KEYS_PER_TENANT: z.coerce.number().int().min(1).default(20),
 });
 
 export type AppConfig = z.infer<typeof ConfigSchema>;

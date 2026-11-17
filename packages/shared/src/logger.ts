@@ -13,15 +13,18 @@ export interface LogContext {
  * Invariant 4: Secrets (API keys, signing secrets) are NEVER logged.
  * Pino redaction is enforced at the logger configuration level.
  */
-export function createLogger(options?: {
-  name?: string;
-  level?: string;
-  bindings?: LogContext;
-}): pino.Logger {
+export function createLogger(
+  options?: {
+    name?: string;
+    level?: string;
+    bindings?: LogContext;
+  },
+  destination?: pino.DestinationStream,
+): pino.Logger {
   const { name = "hookrelay", level = process.env.LOG_LEVEL || "info", bindings = {} } =
     options || {};
 
-  return pino({
+  const pinoOpts: pino.LoggerOptions = {
     name,
     level,
     formatters: {
@@ -34,6 +37,12 @@ export function createLogger(options?: {
       paths: [
         "apiKey",
         "*.apiKey",
+        "api_key",
+        "*.api_key",
+        "api_key.key",
+        "*.api_key.key",
+        "key",
+        "*.key",
         "secret",
         "*.secret",
         "signingSecret",
@@ -42,10 +51,19 @@ export function createLogger(options?: {
         "*.password",
         "authorization",
         "headers.authorization",
+        "headers['authorization']",
         "*.authorization",
+        "req.headers.authorization",
+        "req.headers['authorization']",
+        "*.req.headers.authorization",
+        "adminToken",
+        "*.adminToken",
+        "ADMIN_TOKEN",
       ],
       censor: "[REDACTED]",
     },
     base: bindings,
-  });
+  };
+
+  return destination ? pino(pinoOpts, destination) : pino(pinoOpts);
 }

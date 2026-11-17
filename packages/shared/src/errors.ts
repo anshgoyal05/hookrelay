@@ -1,13 +1,17 @@
 import type { ProblemDetails } from "./types/index.js";
 
 export const PROBLEM_TYPES = {
-  BAD_REQUEST: "https://hookrelay.dev/problems/bad-request",
-  VALIDATION_ERROR: "https://hookrelay.dev/problems/validation-error",
-  UNAUTHORIZED: "https://hookrelay.dev/problems/unauthorized",
-  FORBIDDEN: "https://hookrelay.dev/problems/forbidden",
-  NOT_FOUND: "https://hookrelay.dev/problems/not-found",
-  SERVICE_UNAVAILABLE: "https://hookrelay.dev/problems/service-unavailable",
-  INTERNAL_ERROR: "https://hookrelay.dev/problems/internal-server-error",
+  BAD_REQUEST: "urn:hookrelay:problem:bad-request",
+  VALIDATION_ERROR: "urn:hookrelay:problem:validation-error",
+  UNAUTHORIZED: "urn:hookrelay:problem:unauthorized",
+  FORBIDDEN: "urn:hookrelay:problem:forbidden",
+  NOT_FOUND: "urn:hookrelay:problem:not-found",
+  CONFLICT: "urn:hookrelay:problem:conflict",
+  LAST_ACTIVE_KEY: "urn:hookrelay:problem:last-active-key",
+  KEY_LIMIT_REACHED: "urn:hookrelay:problem:key-limit-reached",
+  SERVICE_UNAVAILABLE: "urn:hookrelay:problem:service-unavailable",
+  ADMIN_DISABLED: "urn:hookrelay:problem:admin-disabled",
+  INTERNAL_ERROR: "urn:hookrelay:problem:internal-server-error",
 } as const;
 
 export class ProblemError extends Error {
@@ -27,6 +31,7 @@ export function createProblemDetails(options: {
   detail?: string;
   instance?: string;
   invalidParams?: Array<{ name: string; reason: string }>;
+  request_id?: string;
   extensions?: Record<string, unknown>;
 }): ProblemDetails {
   const {
@@ -36,6 +41,7 @@ export function createProblemDetails(options: {
     detail,
     instance,
     invalidParams,
+    request_id,
     extensions = {},
   } = options;
 
@@ -45,6 +51,7 @@ export function createProblemDetails(options: {
     status,
     ...(detail ? { detail } : {}),
     ...(instance ? { instance } : {}),
+    ...(request_id ? { request_id } : {}),
     ...(invalidParams && invalidParams.length > 0 ? { invalidParams } : {}),
     ...extensions,
   };

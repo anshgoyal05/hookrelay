@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { buildServer, type ApiDependencies } from "../src/server.js";
-import { createLogger } from "@hookrelay/shared";
+import { createLogger, PROBLEM_TYPES } from "@hookrelay/shared";
 
 const testLogger = createLogger({ name: "test-api", level: "silent" });
 
@@ -73,7 +73,7 @@ describe("apps/api - Health & Readiness Endpoints", () => {
     expect(response.headers["content-type"]).toContain("application/problem+json");
 
     const body = response.json();
-    expect(body.type).toBe("https://hookrelay.dev/problems/service-unavailable");
+    expect(body.type).toBe(PROBLEM_TYPES.SERVICE_UNAVAILABLE);
     expect(body.status).toBe(503);
     expect(body.checks.postgres).toBe("down");
     expect(body.checks.redis).toBe("ok");

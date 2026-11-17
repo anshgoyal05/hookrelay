@@ -1,22 +1,34 @@
 import fastify from "fastify";
 import { randomUUID } from "node:crypto";
+import type { Pool } from "pg";
+import type { Redis } from "ioredis";
 import {
   createLogger,
   createProblemDetails,
   PROBLEM_TYPES,
+  LastUsedThrottler,
   type ReadinessChecks,
   type ReadinessResult,
   type LivenessResult,
 } from "@hookrelay/shared";
 import type { Logger } from "pino";
+import { adminRoutes } from "./routes/admin.js";
+import { apiKeyRoutes } from "./routes/api-keys.js";
 
 export interface PgCheckable {
-  query: (text: string) => Promise<unknown>;
+  query: (text: string, params?: unknown[]) => Promise<{ rows: unknown[] }>;
+  connect?: () => Promise<{
+    query: (text: string, params?: unknown[]) => Promise<{ rows: unknown[] }>;
+    release: () => void;
+  }>;
 }
 
 export interface RedisCheckable {
   ping: () => Promise<string>;
+  status?: string;
 }
+
+export type RedisClientType = Redis | RedisCheckable;
 
 export interface AmqpCheckable {
   isConnected: () => boolean;
@@ -24,9 +36,12 @@ export interface AmqpCheckable {
 
 export interface ApiDependencies {
   pgPool: PgCheckable;
-  redisClient: RedisCheckable;
+  redisClient: RedisClientType;
   amqpConnection: AmqpCheckable;
   logger?: Logger;
+  adminToken?: string;
+  maxActiveKeys?: number;
+  throttler?: LastUsedThrottler;
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs = 2000): Promise<T> {
@@ -47,6 +62,15 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs = 2000): Promise<T>
 export function buildServer(dependencies: ApiDependencies) {
   const logger = dependencies.logger ?? createLogger({ name: "hookrelay-api" });
 
+  const throttler =
+    dependencies.throttler ??
+    new LastUsedThrottler({
+      redisClient: dependencies.redisClient as unknown as Redis,
+      db: dependencies.pgPool,
+      logger,
+      throttleSeconds: 60,
+    });
+
   const app = fastify({
     genReqId: (req) => {
       const headerReqId = req.headers["x-request-id"];
@@ -55,11 +79,16 @@ export function buildServer(dependencies: ApiDependencies) {
     loggerInstance: logger,
   });
 
+  // Inject X-Request-Id header on all responses
+  app.addHook("onSend", async (request, reply) => {
+    reply.header("x-request-id", request.id);
+  });
+
   // RFC 7807 error handler
   app.setErrorHandler((error: unknown, request, reply) => {
     request.log.error({ err: error }, "Unhandled request error");
 
-    const errObj = error as { statusCode?: number; name?: string; message?: string };
+    const errObj = error as { statusCode?: number; name?: string; message?: string; validation?: unknown[] };
     const status =
       typeof errObj.statusCode === "number" && errObj.statusCode >= 400
         ? errObj.statusCode
@@ -76,6 +105,7 @@ export function buildServer(dependencies: ApiDependencies) {
       status,
       detail: errObj.message || "An unexpected error occurred",
       instance: request.url,
+      request_id: request.id,
     });
 
     reply.type("application/problem+json").status(status).send(problem);
@@ -139,6 +169,7 @@ export function buildServer(dependencies: ApiDependencies) {
         status: 503,
         detail: "One or more required infrastructure dependencies are not ready",
         instance: request.url,
+        request_id: request.id,
         extensions: {
           checks,
           timestamp: new Date().toISOString(),
@@ -155,6 +186,18 @@ export function buildServer(dependencies: ApiDependencies) {
     };
 
     return reply.status(200).send(response);
+  });
+
+  // Register Admin and API Key routes
+  app.register(adminRoutes, {
+    pgPool: dependencies.pgPool as Pool,
+    adminToken: dependencies.adminToken,
+  });
+
+  app.register(apiKeyRoutes, {
+    pgPool: dependencies.pgPool as Pool,
+    throttler,
+    maxActiveKeys: dependencies.maxActiveKeys,
   });
 
   return app;

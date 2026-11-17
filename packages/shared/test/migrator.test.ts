@@ -52,32 +52,26 @@ describe("packages/shared - Database Migration Runner", () => {
 
   it("idempotent re-run: skips migrations that have already been applied", async () => {
     const executedQueries: string[] = [];
-    // First run to get current checksum
-    let appliedChecksum = "";
+    const recordedRows: Array<{ version: string; name: string; checksum: string }> = [];
+
     const firstClient: MigrationClient = {
       query: async (sql: string, params?: unknown[]) => {
         if (sql.includes("INSERT INTO schema_migrations")) {
-          const [, , checksum] = params as [string, string, string];
-          appliedChecksum = checksum;
+          const [version, name, checksum] = params as [string, string, string];
+          recordedRows.push({ version, name, checksum });
         }
         return { rows: [] };
       },
     };
     await runMigrations(firstClient, { logger: silentLogger });
 
-    // Second run: mock DB already has the migration recorded
+    // Second run: mock DB already has the migrations recorded
     const secondClient: MigrationClient = {
       query: async (sql: string) => {
         executedQueries.push(sql.trim());
         if (sql.includes("SELECT version, name, checksum FROM schema_migrations")) {
           return {
-            rows: [
-              {
-                version: "0001",
-                name: "initial_schema",
-                checksum: appliedChecksum,
-              },
-            ],
+            rows: [...recordedRows],
           };
         }
         return { rows: [] };
