@@ -5,5 +5,6 @@ export * from "./logger.js";
 export * from "./db/migrator.js";
 export * from "./amqp.js";
 export * from "./crypto/keys.js";
+export * from "./crypto/secrets.js";
 export * from "./auth/throttler.js";
 export * from "./ssrf/index.js";

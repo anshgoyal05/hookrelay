@@ -28,12 +28,32 @@ export const ConfigSchema = z
       .optional(),
     MAX_ACTIVE_KEYS_PER_TENANT: z.coerce.number().int().min(1).default(20),
     ALLOW_PRIVATE_TARGETS: z.coerce.boolean().default(false),
+    ENCRYPTION_KEY: z
+      .string({
+        required_error: "ENCRYPTION_KEY is required (generate with: openssl rand -hex 32)",
+      })
+      .regex(/^[0-9a-fA-F]{64}$/, "ENCRYPTION_KEY must be a 64-character hex string (32 bytes)"),
+    MAX_ENDPOINTS_PER_TENANT: z.coerce.number().int().min(1).default(50),
+    SECRET_ROTATION_GRACE_SECONDS: z.coerce.number().int().min(60).default(86400),
   })
   .refine(
     (data) => !(data.NODE_ENV === "production" && data.ALLOW_PRIVATE_TARGETS === true),
     {
       message: "ALLOW_PRIVATE_TARGETS cannot be enabled when NODE_ENV is 'production'",
       path: ["ALLOW_PRIVATE_TARGETS"],
+    },
+  )
+  .refine(
+    (data) => {
+      const placeholder = "0000000000000000000000000000000000000000000000000000000000000000";
+      if (data.NODE_ENV !== "test" && data.ENCRYPTION_KEY === placeholder) {
+        return false;
+      }
+      return true;
+    },
+    {
+      message: "ENCRYPTION_KEY placeholder cannot be used outside test environments. Generate with: openssl rand -hex 32",
+      path: ["ENCRYPTION_KEY"],
     },
   );
 
