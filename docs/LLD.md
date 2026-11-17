@@ -195,3 +195,53 @@ Every index in HookRelay is mapped directly to an operational query pattern:
   - Tamper detection: Hashes `.sql` file contents with SHA-256 and records them in `schema_migrations`. If an applied file is modified, the runner halts with `MigrationChecksumMismatchError`.
   - Transactional isolation: Each file is wrapped in an atomic `BEGIN ... COMMIT` block.
   - Note on `CONCURRENTLY`: PostgreSQL forbids `CREATE INDEX CONCURRENTLY` inside transaction blocks; standard migrations run within transactions, whereas zero-downtime concurrent index builds must be executed outside transaction blocks.
+
+## 5. Outbound URL Safety & SSRF Defense Architecture (Invariant 5)
+
+HookRelay implements a multi-layered defense-in-depth model to prevent Server-Side Request Forgery (SSRF) and protect internal networks, cloud metadata services, and local infrastructure:
+
+### 5.1 Architecture & Component Division
+The safety module in `@hookrelay/shared` (`src/ssrf/index.ts`) provides two core primitives:
+1. `validateEndpointUrl(url, options)`:
+   - Validates URL syntax, scheme (`https:` required; `http:` allowed only when `ALLOW_HTTP=true`), port numbers, credentials in authority, and hostname characteristics.
+   - Resolves all DNS records (`A` and `AAAA`) using `dns.promises.lookup(host, { all: true, verbatim: true })` and validates every resolved address against the IP access rules.
+   - Normalizes the URL string for database storage.
+2. `isAddressAllowed(ip, options)`:
+   - Evaluates a single canonical IP address (IPv4 or IPv6) against a comprehensive blocklist.
+   - Accepts only canonical IP literals validated via `net.isIP(ip)`. Zone IDs (e.g. `fe80::1%en0`) and non-canonical forms are strictly rejected.
+
+### 5.2 Registration Validation is Advisory Only
+Validation performed at endpoint registration (`POST /v1/endpoints`) is strictly **advisory** and serves as a fast-fail UX check:
+- **DNS Rebinding & TTL Expiry Hazard**: An attacker can register a domain pointing to an innocent public IP (passing registration checks) and configure an authoritative DNS server with a low TTL (e.g., 0–5 seconds). When the webhook delivery worker attempts delivery later, the DNS server responds with `169.254.169.254` (cloud metadata) or `10.0.0.1` (internal network).
+- **Enforcement Mandate**: Day 4 delivery workers MUST re-validate the target IP address immediately prior to or during connection establishment (e.g., via a custom HTTP agent or socket `lookup` hook). An endpoint passing registration validation is never assumed safe at runtime.
+
+### 5.3 IP Filtering & Default-Deny Policy
+- **IPv4 Filtering**: Uses `node:net.BlockList` covering the entire IANA special-purpose registry:
+  - Private networks: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` (RFC 1918).
+  - Loopback: `127.0.0.0/8` (RFC 1122).
+  - Link-local & cloud metadata: `169.254.0.0/16` (RFC 3927, AWS/GCP/DigitalOcean metadata) and `168.63.129.16/32` (Azure wire server).
+  - Carrier-Grade NAT (CGNAT): `100.64.0.0/10` (RFC 6598).
+  - Multicast & broadcast: `224.0.0.0/4`, `255.255.255.255/32`.
+  - Documentation & benchmark: `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`, `198.18.0.0/15`.
+  - Additional IANA reservations: `192.88.99.0/24` (6to4 relay), `192.31.196.0/24` (AS112-v4), `192.52.193.0/24` (AMT), `192.175.48.0/24` (Direct Delegation AS112), `0.0.0.0/8` (Current network).
+- **IPv6 Default-Deny**:
+  - Global Unicast range `2000::/3` is the only permitted IPv6 space.
+  - All special-purpose ranges carved out of `2000::/3` are explicitly blocked: `2001::/23` (including Teredo `2001::/32` and Documentation `2001:db8::/32`), `2002::/16` (6to4), and `64:ff9b:1::/48` (Local-use IPv4/IPv6 translation).
+  - All non-global spaces are blocked: `::1/128` (loopback), `::/128` (unspecified), `fc00::/7` (Unique Local Address / ULA), `fe80::/10` (link-local), `fec0::/10` (site-local), `ff00::/8` (multicast), and `::/96` (IPv4-compatible).
+  - IPv4-mapped IPv6 addresses (`::ffff:0:0/96`, e.g. `::ffff:127.0.0.1` or `::ffff:169.254.169.254`) have their inner IPv4 address extracted and evaluated against the full IPv4 blocklist.
+
+### 5.4 Port Policy
+- **Permitted Ports**:
+  - Standard web ports: `443` (and `80` only when `allowHttp` is explicitly enabled).
+  - Unprivileged ports: Any port $\ge 1024$ and $\le 65535$, excluding sensitive service ports.
+- **Sensitive Port Blocklist**:
+  - Remote access & management: `22` (SSH), `23` (Telnet), `3389` (RDP).
+  - Infrastructure & databases: `2375`, `2376` (Docker daemon), `3306` (MySQL), `5432` (PostgreSQL), `6379` (Redis), `11211` (Memcached), `27017` (MongoDB), `9200`, `9300` (Elasticsearch), `5672`, `15672` (RabbitMQ).
+  - Core network services: `25`, `465`, `587` (SMTP/mail), `53` (DNS), `445` (SMB), `137`, `138`, `139` (NetBIOS), `161` (SNMP), `389`, `636` (LDAP).
+
+### 5.5 True Backstop: Network-Level Egress Policies
+Application-level URL validation and socket-level IP checks represent the first two lines of defense. However, **application code is not the ultimate security boundary**:
+- Misconfigurations, 0-day resolver bugs, or container escapes could bypass runtime checks.
+- In production, the **true and non-negotiable backstop** is network-level egress control:
+  - **Kubernetes NetworkPolicy / Calico**: Deny worker pod egress to private CIDRs (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local (`169.254.0.0/16`), and internal VPC service subnets.
+  - **Cloud VPC / Firewall Rules**: Egress gateway or NAT instances restricting outbound traffic exclusively to the public Internet, with explicit drops on internal metadata endpoints (`169.254.169.254`, `168.63.129.16`).

@@ -1,32 +1,41 @@
 import { z } from "zod";
 
-export const ConfigSchema = z.object({
-  NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
-  PORT: z.coerce.number().int().min(1).max(65535).default(3000),
-  LOG_LEVEL: z
-    .enum(["fatal", "error", "warn", "info", "debug", "trace"])
-    .default("info"),
-  DATABASE_URL: z
-    .string({
-      required_error: "DATABASE_URL is required (e.g. postgres://user:pass@localhost:5432/db)",
-    })
-    .min(1, "DATABASE_URL cannot be empty"),
-  REDIS_URL: z
-    .string({
-      required_error: "REDIS_URL is required (e.g. redis://localhost:6379)",
-    })
-    .min(1, "REDIS_URL cannot be empty"),
-  RABBITMQ_URL: z
-    .string({
-      required_error: "RABBITMQ_URL is required (e.g. amqp://guest:guest@localhost:5672)",
-    })
-    .min(1, "RABBITMQ_URL cannot be empty"),
-  ADMIN_TOKEN: z
-    .string()
-    .min(32, "ADMIN_TOKEN must be at least 32 characters if configured")
-    .optional(),
-  MAX_ACTIVE_KEYS_PER_TENANT: z.coerce.number().int().min(1).default(20),
-});
+export const ConfigSchema = z
+  .object({
+    NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+    PORT: z.coerce.number().int().min(1).max(65535).default(3000),
+    LOG_LEVEL: z
+      .enum(["fatal", "error", "warn", "info", "debug", "trace"])
+      .default("info"),
+    DATABASE_URL: z
+      .string({
+        required_error: "DATABASE_URL is required (e.g. postgres://user:pass@localhost:5432/db)",
+      })
+      .min(1, "DATABASE_URL cannot be empty"),
+    REDIS_URL: z
+      .string({
+        required_error: "REDIS_URL is required (e.g. redis://localhost:6379)",
+      })
+      .min(1, "REDIS_URL cannot be empty"),
+    RABBITMQ_URL: z
+      .string({
+        required_error: "RABBITMQ_URL is required (e.g. amqp://guest:guest@localhost:5672)",
+      })
+      .min(1, "RABBITMQ_URL cannot be empty"),
+    ADMIN_TOKEN: z
+      .string()
+      .min(32, "ADMIN_TOKEN must be at least 32 characters if configured")
+      .optional(),
+    MAX_ACTIVE_KEYS_PER_TENANT: z.coerce.number().int().min(1).default(20),
+    ALLOW_PRIVATE_TARGETS: z.coerce.boolean().default(false),
+  })
+  .refine(
+    (data) => !(data.NODE_ENV === "production" && data.ALLOW_PRIVATE_TARGETS === true),
+    {
+      message: "ALLOW_PRIVATE_TARGETS cannot be enabled when NODE_ENV is 'production'",
+      path: ["ALLOW_PRIVATE_TARGETS"],
+    },
+  );
 
 export type AppConfig = z.infer<typeof ConfigSchema>;
 
