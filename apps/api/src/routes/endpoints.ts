@@ -62,6 +62,38 @@ const PatchEndpointSchema = z
     },
   );
 
+// Subscriptions Schemas
+const EventTypeItemSchema = z
+  .string()
+  .min(1, "event type cannot be empty")
+  .max(128, "event type cannot exceed 128 characters")
+  .refine(
+    (val) => val === "*" || /^[a-z0-9]{1,64}(\.[a-z0-9_-]{1,64})*$/.test(val),
+    {
+      message: "Event type must match pattern '^[a-z0-9]{1,64}(\\.[a-z0-9_-]{1,64})*$' or '*'",
+    },
+  );
+
+const SubscriptionsBodySchema = z
+  .object({
+    event_types: z
+      .array(EventTypeItemSchema)
+      .max(100, "Maximum 100 event types per endpoint"),
+  })
+  .refine(
+    (data) => {
+      const deduped = Array.from(new Set(data.event_types));
+      if (deduped.includes("*") && deduped.length > 1) {
+        return false;
+      }
+      return true;
+    },
+    {
+      message: "Cannot mix wildcard '*' with specific event types",
+      path: ["event_types"],
+    },
+  );
+
 export interface EndpointRoutesOptions {
   pgPool: Pool;
   throttler: LastUsedThrottler;
@@ -78,11 +110,14 @@ function sendValidationError(
   detail: string,
   issues?: z.ZodIssue[],
 ) {
+  const effectiveDetail =
+    issues && issues.length > 0 && issues[0]?.message ? issues[0].message : detail;
+
   const problem = createProblemDetails({
     type: ENDPOINT_PROBLEM_TYPES.VALIDATION_ERROR,
     title: "Validation Error",
     status: 400,
-    detail,
+    detail: effectiveDetail,
     instance: request.url,
     request_id: request.id,
     invalidParams: issues?.map((i) => ({
@@ -648,6 +683,178 @@ export const endpointRoutes: FastifyPluginAsync<EndpointRoutesOptions> = async (
       } finally {
         client.release();
       }
+    },
+  );
+
+  // 8. POST /v1/endpoints/:id/rotate-secret - Rotate signing secret
+  fastify.post(
+    "/v1/endpoints/:id/rotate-secret",
+    { preHandler: apiKeyAuth },
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      const paramsResult = EndpointParamsSchema.safeParse(request.params);
+      if (!paramsResult.success) {
+        return sendValidationError(request, reply, "Invalid endpoint ID.", paramsResult.error.issues);
+      }
+
+      const { id } = paramsResult.data;
+      const tenantId = request.tenantId!;
+      const graceSeconds = options.secretRotationGraceSeconds ?? 86400;
+
+      const client = await options.pgPool.connect();
+      try {
+        await client.query("BEGIN");
+
+        // Lock row to serialize concurrent rotations
+        const existing = await client.query(
+          `SELECT id, signing_secret FROM endpoints
+          WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+          FOR UPDATE`,
+          [id, tenantId],
+        );
+
+        if (existing.rows.length === 0) {
+          await client.query("ROLLBACK");
+          return sendNotFound(request, reply);
+        }
+
+        const currentSigningSecret = existing.rows[0].signing_secret;
+        const newRawSecret = generateSigningSecret();
+        const newEncryptedSecret = encryptSigningSecret(newRawSecret, options.encryptionKey, id);
+
+        // Move old signing_secret to previous_secret with fresh expiration; replaces any earlier previous_secret
+        const updateRes = await client.query(
+          `UPDATE endpoints
+          SET
+            signing_secret = $3,
+            previous_secret = $4,
+            previous_secret_expires_at = now() + ($5 || ' seconds')::interval,
+            updated_at = now(),
+            version = version + 1
+          WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL
+          RETURNING
+            id,
+            to_char(previous_secret_expires_at, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as previous_secret_expires_at,
+            version`,
+          [id, tenantId, newEncryptedSecret, currentSigningSecret, graceSeconds],
+        );
+
+        await client.query("COMMIT");
+
+        request.log.info({ endpoint_id: id }, "Signing secret rotated successfully");
+
+        const row = updateRes.rows[0];
+        return reply.status(200).send({
+          endpoint_id: row.id,
+          signing_secret: newRawSecret, // returned strictly once
+          previous_secret_expires_at: row.previous_secret_expires_at,
+          version: row.version,
+        });
+      } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
+        throw err;
+      } finally {
+        client.release();
+      }
+    },
+  );
+
+  // 9. PUT /v1/endpoints/:id/subscriptions - Atomically replace subscription set
+  fastify.put(
+    "/v1/endpoints/:id/subscriptions",
+    { preHandler: apiKeyAuth },
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      const paramsResult = EndpointParamsSchema.safeParse(request.params);
+      if (!paramsResult.success) {
+        return sendValidationError(request, reply, "Invalid endpoint ID.", paramsResult.error.issues);
+      }
+
+      const bodyResult = SubscriptionsBodySchema.safeParse(request.body);
+      if (!bodyResult.success) {
+        return sendValidationError(request, reply, "Invalid subscriptions payload.", bodyResult.error.issues);
+      }
+
+      const { id } = paramsResult.data;
+      const tenantId = request.tenantId!;
+      const dedupedTypes = Array.from(new Set(bodyResult.data.event_types));
+
+      const client = await options.pgPool.connect();
+      try {
+        await client.query("BEGIN");
+
+        // Lock parent endpoint row; 404 if missing or soft-deleted
+        const endpointCheck = await client.query(
+          "SELECT id FROM endpoints WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL FOR UPDATE",
+          [id, tenantId],
+        );
+
+        if (endpointCheck.rows.length === 0) {
+          await client.query("ROLLBACK");
+          return sendNotFound(request, reply);
+        }
+
+        // Atomically wipe existing subscriptions
+        await client.query("DELETE FROM endpoint_subscriptions WHERE endpoint_id = $1", [id]);
+
+        // Insert new subscriptions if non-empty
+        if (dedupedTypes.length > 0) {
+          const values: unknown[] = [id];
+          const placeholders: string[] = [];
+          for (let i = 0; i < dedupedTypes.length; i++) {
+            values.push(dedupedTypes[i]);
+            placeholders.push(`($1, $${i + 2})`);
+          }
+          await client.query(
+            `INSERT INTO endpoint_subscriptions (endpoint_id, event_type) VALUES ${placeholders.join(", ")}`,
+            values,
+          );
+        }
+
+        await client.query("COMMIT");
+
+        request.log.info(
+          { endpoint_id: id, count: dedupedTypes.length },
+          "Subscriptions replaced successfully",
+        );
+
+        return reply.status(200).send({ event_types: dedupedTypes });
+      } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
+        throw err;
+      } finally {
+        client.release();
+      }
+    },
+  );
+
+  // 10. GET /v1/endpoints/:id/subscriptions - Get active subscriptions
+  fastify.get(
+    "/v1/endpoints/:id/subscriptions",
+    { preHandler: apiKeyAuth },
+    async (request: FastifyRequest, reply: FastifyReply) => {
+      const paramsResult = EndpointParamsSchema.safeParse(request.params);
+      if (!paramsResult.success) {
+        return sendValidationError(request, reply, "Invalid endpoint ID.", paramsResult.error.issues);
+      }
+
+      const { id } = paramsResult.data;
+      const tenantId = request.tenantId!;
+
+      const endpointCheck = await options.pgPool.query(
+        "SELECT id FROM endpoints WHERE id = $1 AND tenant_id = $2 AND deleted_at IS NULL",
+        [id, tenantId],
+      );
+
+      if (endpointCheck.rows.length === 0) {
+        return sendNotFound(request, reply);
+      }
+
+      const res = await options.pgPool.query(
+        "SELECT event_type FROM endpoint_subscriptions WHERE endpoint_id = $1 ORDER BY event_type ASC",
+        [id],
+      );
+
+      const eventTypes = res.rows.map((r: { event_type: string }) => r.event_type);
+      return reply.status(200).send({ event_types: eventTypes });
     },
   );
 };

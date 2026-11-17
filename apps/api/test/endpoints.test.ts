@@ -630,6 +630,31 @@ describe("apps/api - Endpoint Management API (CRUD & Lifecycle)", () => {
       });
       expect(deleteRes.statusCode).toBe(404);
 
+      // 6. Tenant B rotate-secret -> 404
+      const rotateRes = await testApp.inject({
+        method: "POST",
+        url: `/v1/endpoints/${epA.id}/rotate-secret`,
+        headers: { authorization: `Bearer ${tenantBApiKey}` },
+      });
+      expect(rotateRes.statusCode).toBe(404);
+
+      // 7. Tenant B PUT subscriptions -> 404
+      const putSubRes = await testApp.inject({
+        method: "PUT",
+        url: `/v1/endpoints/${epA.id}/subscriptions`,
+        headers: { authorization: `Bearer ${tenantBApiKey}` },
+        payload: { event_types: ["*"] },
+      });
+      expect(putSubRes.statusCode).toBe(404);
+
+      // 8. Tenant B GET subscriptions -> 404
+      const getSubRes = await testApp.inject({
+        method: "GET",
+        url: `/v1/endpoints/${epA.id}/subscriptions`,
+        headers: { authorization: `Bearer ${tenantBApiKey}` },
+      });
+      expect(getSubRes.statusCode).toBe(404);
+
       // Verify endpoint A is still intact and active
       const checkA = await testApp.inject({
         method: "GET",
@@ -639,12 +664,417 @@ describe("apps/api - Endpoint Management API (CRUD & Lifecycle)", () => {
       expect(checkA.statusCode).toBe(200);
       expect(checkA.json().status).toBe("active");
     });
+
+    it("returns 404 for soft-deleted endpoints across all management routes", async () => {
+      // Create and delete endpoint under Tenant A
+      const createRes = await testApp.inject({
+        method: "POST",
+        url: "/v1/endpoints",
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+        payload: { url: "https://example.com/to-be-deleted" },
+      });
+      const ep = createRes.json();
+
+      await testApp.inject({
+        method: "DELETE",
+        url: `/v1/endpoints/${ep.id}`,
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+      });
+
+      // Verify every route returns 404 on soft-deleted endpoint
+      const routes = [
+        testApp.inject({ method: "GET", url: `/v1/endpoints/${ep.id}`, headers: { authorization: `Bearer ${tenantAApiKey}` } }),
+        testApp.inject({ method: "PATCH", url: `/v1/endpoints/${ep.id}`, headers: { authorization: `Bearer ${tenantAApiKey}` }, payload: { description: "Updated" } }),
+        testApp.inject({ method: "POST", url: `/v1/endpoints/${ep.id}/pause`, headers: { authorization: `Bearer ${tenantAApiKey}` } }),
+        testApp.inject({ method: "POST", url: `/v1/endpoints/${ep.id}/resume`, headers: { authorization: `Bearer ${tenantAApiKey}` } }),
+        testApp.inject({ method: "POST", url: `/v1/endpoints/${ep.id}/rotate-secret`, headers: { authorization: `Bearer ${tenantAApiKey}` } }),
+        testApp.inject({ method: "PUT", url: `/v1/endpoints/${ep.id}/subscriptions`, headers: { authorization: `Bearer ${tenantAApiKey}` }, payload: { event_types: ["*"] } }),
+        testApp.inject({ method: "GET", url: `/v1/endpoints/${ep.id}/subscriptions`, headers: { authorization: `Bearer ${tenantAApiKey}` } }),
+        testApp.inject({ method: "DELETE", url: `/v1/endpoints/${ep.id}`, headers: { authorization: `Bearer ${tenantAApiKey}` } }),
+      ];
+
+      const results = await Promise.all(routes);
+      for (const res of results) {
+        expect(res.statusCode).toBe(404);
+      }
+    });
   });
 
-  describe("9. Safe Logging & Secret Leak Scanner", () => {
+  describe("9. POST /v1/endpoints/:id/rotate-secret (Secret Rotation)", () => {
+    it("rotates signing secret once, moves previous secret with expiration, and decrypts accurately", async () => {
+      const createRes = await testApp.inject({
+        method: "POST",
+        url: "/v1/endpoints",
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+        payload: { url: "https://example.com/rotate-target" },
+      });
+      const initial = createRes.json();
+      const initialSecret = initial.signing_secret;
+
+      // Rotate secret
+      const rotateRes = await testApp.inject({
+        method: "POST",
+        url: `/v1/endpoints/${initial.id}/rotate-secret`,
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+      });
+
+      expect(rotateRes.statusCode).toBe(200);
+      const rotated = rotateRes.json();
+      expect(rotated.endpoint_id).toBe(initial.id);
+      expect(rotated.signing_secret).toMatch(/^whsec_[A-Za-z0-9+/=]{44}$/);
+      expect(rotated.signing_secret).not.toBe(initialSecret);
+      expect(rotated.previous_secret_expires_at).toBeDefined();
+      expect(rotated.version).toBe(2);
+
+      // Verify DB storage: current signing_secret is new secret, previous_secret is old secret
+      const dbRow = await testPool.query(
+        "SELECT signing_secret, previous_secret, previous_secret_expires_at FROM endpoints WHERE id = $1",
+        [initial.id],
+      );
+      const row = dbRow.rows[0];
+
+      const decryptedCurrent = decryptSigningSecret(row.signing_secret, TEST_ENCRYPTION_KEY, initial.id);
+      expect(decryptedCurrent).toBe(rotated.signing_secret);
+
+      const decryptedPrevious = decryptSigningSecret(row.previous_secret, TEST_ENCRYPTION_KEY, initial.id);
+      expect(decryptedPrevious).toBe(initialSecret);
+    });
+
+    it("handles double rotation: rotating twice in a row replaces previous secret and never leaves an expired secret active", async () => {
+      const createRes = await testApp.inject({
+        method: "POST",
+        url: "/v1/endpoints",
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+        payload: { url: "https://example.com/double-rotate" },
+      });
+      const ep = createRes.json();
+      const secret0 = ep.signing_secret;
+
+      // Rotation 1
+      const rot1 = await testApp.inject({
+        method: "POST",
+        url: `/v1/endpoints/${ep.id}/rotate-secret`,
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+      });
+      const secret1 = rot1.json().signing_secret;
+
+      // Rotation 2 immediately
+      const rot2 = await testApp.inject({
+        method: "POST",
+        url: `/v1/endpoints/${ep.id}/rotate-secret`,
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+      });
+      const secret2 = rot2.json().signing_secret;
+
+      expect(secret2).not.toBe(secret1);
+      expect(secret1).not.toBe(secret0);
+
+      // Verify DB row: signing_secret is secret2, previous_secret is secret1 (secret0 is gone)
+      const dbRow = await testPool.query(
+        "SELECT signing_secret, previous_secret, previous_secret_expires_at FROM endpoints WHERE id = $1",
+        [ep.id],
+      );
+      const row = dbRow.rows[0];
+
+      const decryptedCurrent = decryptSigningSecret(row.signing_secret, TEST_ENCRYPTION_KEY, ep.id);
+      expect(decryptedCurrent).toBe(secret2);
+
+      const decryptedPrevious = decryptSigningSecret(row.previous_secret, TEST_ENCRYPTION_KEY, ep.id);
+      expect(decryptedPrevious).toBe(secret1);
+
+      // Expiration must be in the future (~24 hours from now)
+      const expiresAt = new Date(row.previous_secret_expires_at).getTime();
+      expect(expiresAt).toBeGreaterThan(Date.now() + 80_000 * 1000);
+    });
+
+    it("serializes concurrent rotations to leave a consistent database state", async () => {
+      const createRes = await testApp.inject({
+        method: "POST",
+        url: "/v1/endpoints",
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+        payload: { url: "https://example.com/concurrent-rotate" },
+      });
+      const ep = createRes.json();
+
+      // Launch 5 parallel rotations
+      const promises = Array.from({ length: 5 }, () =>
+        testApp.inject({
+          method: "POST",
+          url: `/v1/endpoints/${ep.id}/rotate-secret`,
+          headers: { authorization: `Bearer ${tenantAApiKey}` },
+        }),
+      );
+
+      const responses = await Promise.all(promises);
+      for (const res of responses) {
+        expect(res.statusCode).toBe(200);
+        expect(res.json().signing_secret).toMatch(/^whsec_/);
+      }
+
+      // Final version in DB must be exactly 6 (initial version 1 + 5 rotations)
+      const dbRow = await testPool.query(
+        "SELECT version, signing_secret, previous_secret FROM endpoints WHERE id = $1",
+        [ep.id],
+      );
+      expect(dbRow.rows[0].version).toBe(6);
+
+      // Both signing_secret and previous_secret must decrypt without error
+      expect(() => {
+        decryptSigningSecret(dbRow.rows[0].signing_secret, TEST_ENCRYPTION_KEY, ep.id);
+      }).not.toThrow();
+      expect(() => {
+        decryptSigningSecret(dbRow.rows[0].previous_secret, TEST_ENCRYPTION_KEY, ep.id);
+      }).not.toThrow();
+    });
+  });
+
+  describe("10. Subscriptions (PUT & GET Atomicity)", () => {
+    it("replaces subscription set atomically, supports wildcard, and dedupes types", async () => {
+      const createRes = await testApp.inject({
+        method: "POST",
+        url: "/v1/endpoints",
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+        payload: { url: "https://example.com/sub-test" },
+      });
+      const ep = createRes.json();
+
+      // 1. Initial subscription set with duplicate
+      const putRes = await testApp.inject({
+        method: "PUT",
+        url: `/v1/endpoints/${ep.id}/subscriptions`,
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+        payload: {
+          event_types: ["payment.created", "user.signup", "payment.created"],
+        },
+      });
+
+      expect(putRes.statusCode).toBe(200);
+      expect(putRes.json().event_types).toEqual(["payment.created", "user.signup"]);
+
+      // 2. GET subscriptions
+      const getRes = await testApp.inject({
+        method: "GET",
+        url: `/v1/endpoints/${ep.id}/subscriptions`,
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+      });
+      expect(getRes.statusCode).toBe(200);
+      expect(getRes.json().event_types).toEqual(["payment.created", "user.signup"]);
+
+      // 3. Replace with wildcard '*'
+      const wildcardRes = await testApp.inject({
+        method: "PUT",
+        url: `/v1/endpoints/${ep.id}/subscriptions`,
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+        payload: { event_types: ["*"] },
+      });
+      expect(wildcardRes.statusCode).toBe(200);
+      expect(wildcardRes.json().event_types).toEqual(["*"]);
+
+      // 4. Empty list means receives nothing
+      const emptyRes = await testApp.inject({
+        method: "PUT",
+        url: `/v1/endpoints/${ep.id}/subscriptions`,
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+        payload: { event_types: [] },
+      });
+      expect(emptyRes.statusCode).toBe(200);
+      expect(emptyRes.json().event_types).toEqual([]);
+
+      const getEmpty = await testApp.inject({
+        method: "GET",
+        url: `/v1/endpoints/${ep.id}/subscriptions`,
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+      });
+      expect(getEmpty.json().event_types).toEqual([]);
+    });
+
+    it("rejects mixing wildcard '*' with specific event types", async () => {
+      const createRes = await testApp.inject({
+        method: "POST",
+        url: "/v1/endpoints",
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+        payload: { url: "https://example.com/sub-wildcard-mix" },
+      });
+      const ep = createRes.json();
+
+      const res = await testApp.inject({
+        method: "PUT",
+        url: `/v1/endpoints/${ep.id}/subscriptions`,
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+        payload: { event_types: ["*", "payment.created"] },
+      });
+
+      expect(res.statusCode).toBe(400);
+      expect(res.json().detail).toContain("Cannot mix wildcard '*' with specific event types");
+    });
+
+    it("rejects invalid event type names and overlong names", async () => {
+      const createRes = await testApp.inject({
+        method: "POST",
+        url: "/v1/endpoints",
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+        payload: { url: "https://example.com/sub-invalid-name" },
+      });
+      const ep = createRes.json();
+
+      // Uppercase is invalid
+      const res1 = await testApp.inject({
+        method: "PUT",
+        url: `/v1/endpoints/${ep.id}/subscriptions`,
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+        payload: { event_types: ["Payment.Created"] },
+      });
+      expect(res1.statusCode).toBe(400);
+
+      // Over 128 characters is invalid
+      const res2 = await testApp.inject({
+        method: "PUT",
+        url: `/v1/endpoints/${ep.id}/subscriptions`,
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+        payload: { event_types: ["a".repeat(129)] },
+      });
+      expect(res2.statusCode).toBe(400);
+    });
+
+    it("proves subscription replacement is atomic: failure mid-way preserves the old set intact", async () => {
+      const createRes = await testApp.inject({
+        method: "POST",
+        url: "/v1/endpoints",
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+        payload: { url: "https://example.com/sub-atomic-fail" },
+      });
+      const ep = createRes.json();
+
+      // Seed initial subscriptions
+      await testApp.inject({
+        method: "PUT",
+        url: `/v1/endpoints/${ep.id}/subscriptions`,
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+        payload: { event_types: ["initial.event.one", "initial.event.two"] },
+      });
+
+      // Temporarily intercept client.query to fail when inserting new subscriptions
+      const origConnect = testPool.connect.bind(testPool);
+      let shouldFail = true;
+
+      // Support both Promise and Callback signatures of pg.Pool.prototype.connect
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (testPool as any).connect = function (
+        cb?: (err: Error | null, client: unknown, release: () => void) => void,
+      ) {
+        if (cb) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          return origConnect((err: Error | null, client: any, release: () => void) => {
+            if (err) return cb(err, client, release);
+            const origQuery = client.query.bind(client);
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            client.query = async function (text: unknown, ...args: any[]) {
+              if (
+                shouldFail &&
+                typeof text === "string" &&
+                text.startsWith("INSERT INTO endpoint_subscriptions")
+              ) {
+                shouldFail = false;
+                throw new Error("Simulated mid-transaction failure during INSERT");
+              }
+              return origQuery(text, ...args);
+            };
+            return cb(null, client, release);
+          });
+        }
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return origConnect().then((client: any) => {
+          const origQuery = client.query.bind(client);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          client.query = async function (text: unknown, ...args: any[]) {
+            if (
+              shouldFail &&
+              typeof text === "string" &&
+              text.startsWith("INSERT INTO endpoint_subscriptions")
+            ) {
+              shouldFail = false;
+              throw new Error("Simulated mid-transaction failure during INSERT");
+            }
+            return origQuery(text, ...args);
+          };
+          return client;
+        });
+      };
+
+      try {
+        const failedRes = await testApp.inject({
+          method: "PUT",
+          url: `/v1/endpoints/${ep.id}/subscriptions`,
+          headers: { authorization: `Bearer ${tenantAApiKey}` },
+          payload: { event_types: ["new.event.one"] },
+        });
+
+        expect(failedRes.statusCode).toBe(500);
+
+        // Verify the initial subscriptions are completely intact
+        const getRes = await testApp.inject({
+          method: "GET",
+          url: `/v1/endpoints/${ep.id}/subscriptions`,
+          headers: { authorization: `Bearer ${tenantAApiKey}` },
+        });
+        expect(getRes.statusCode).toBe(200);
+        expect(getRes.json().event_types).toEqual(["initial.event.one", "initial.event.two"]);
+      } finally {
+        testPool.connect = origConnect;
+      }
+    });
+  });
+
+  describe("11. Safe Logging & Secret Leak Scanner", () => {
     it("never logs query parameters (e.g. ?token=abc123) in captured logs", () => {
       const logsCombined = capturedLogs.join("\n");
       expect(logsCombined.includes("token=abc123")).toBe(false);
+    });
+
+    it("ensures captured logs never contain whsec_ or any secret payloads", async () => {
+      // Create endpoint and rotate secret while tracking the returned secrets
+      const createRes = await testApp.inject({
+        method: "POST",
+        url: "/v1/endpoints",
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+        payload: { url: "https://example.com/leak-test" },
+      });
+      const created = createRes.json();
+      const secret = created.signing_secret;
+      const base64Part = secret.slice("whsec_".length);
+
+      const rotateRes = await testApp.inject({
+        method: "POST",
+        url: `/v1/endpoints/${created.id}/rotate-secret`,
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+      });
+      const rotated = rotateRes.json();
+      const rotSecret = rotated.signing_secret;
+      const rotBase64Part = rotSecret.slice("whsec_".length);
+
+      // Perform get, patch, pause, resume, list
+      await testApp.inject({
+        method: "GET",
+        url: `/v1/endpoints/${created.id}`,
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+      });
+      await testApp.inject({
+        method: "PATCH",
+        url: `/v1/endpoints/${created.id}`,
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+        payload: { description: "Clean update" },
+      });
+      await testApp.inject({
+        method: "GET",
+        url: "/v1/endpoints",
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+      });
+
+      const logsCombined = capturedLogs.join("\n");
+      // Logs must never contain the prefix OR the base64 part
+      expect(logsCombined.includes("whsec_")).toBe(false);
+      expect(logsCombined.includes(base64Part)).toBe(false);
+      expect(logsCombined.includes(rotBase64Part)).toBe(false);
     });
   });
 });
