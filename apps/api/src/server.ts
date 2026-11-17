@@ -14,6 +14,7 @@ import {
 import type { Logger } from "pino";
 import { adminRoutes } from "./routes/admin.js";
 import { apiKeyRoutes } from "./routes/api-keys.js";
+import { endpointRoutes } from "./routes/endpoints.js";
 
 export interface PgCheckable {
   query: (text: string, params?: unknown[]) => Promise<{ rows: unknown[] }>;
@@ -42,6 +43,11 @@ export interface ApiDependencies {
   adminToken?: string;
   maxActiveKeys?: number;
   throttler?: LastUsedThrottler;
+  encryptionKey?: string;
+  maxEndpointsPerTenant?: number;
+  secretRotationGraceSeconds?: number;
+  allowHttp?: boolean;
+  allowPrivateTargets?: boolean;
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs = 2000): Promise<T> {
@@ -198,6 +204,18 @@ export function buildServer(dependencies: ApiDependencies) {
     pgPool: dependencies.pgPool as Pool,
     throttler,
     maxActiveKeys: dependencies.maxActiveKeys,
+  });
+
+  app.register(endpointRoutes, {
+    pgPool: dependencies.pgPool as Pool,
+    throttler,
+    encryptionKey:
+      dependencies.encryptionKey ??
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    maxEndpointsPerTenant: dependencies.maxEndpointsPerTenant,
+    secretRotationGraceSeconds: dependencies.secretRotationGraceSeconds,
+    allowHttp: dependencies.allowHttp,
+    allowPrivateTargets: dependencies.allowPrivateTargets,
   });
 
   return app;

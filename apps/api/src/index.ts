@@ -82,6 +82,11 @@ async function main(): Promise<void> {
     logger,
     adminToken: config.ADMIN_TOKEN,
     maxActiveKeys: config.MAX_ACTIVE_KEYS_PER_TENANT,
+    encryptionKey: config.ENCRYPTION_KEY,
+    maxEndpointsPerTenant: config.MAX_ENDPOINTS_PER_TENANT,
+    secretRotationGraceSeconds: config.SECRET_ROTATION_GRACE_SECONDS,
+    allowHttp: config.NODE_ENV !== "production",
+    allowPrivateTargets: config.ALLOW_PRIVATE_TARGETS,
   });
 
   // Graceful shutdown handling with 10s forced exit timeout
