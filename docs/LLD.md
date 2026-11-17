@@ -147,8 +147,11 @@ erDiagram
    - `revoked_at`: Soft revocation timestamp.
 3. **`endpoints`**:
    - `status`: Stored as `TEXT` with `CHECK (status IN ('active', 'paused', 'disabled'))`. Avoids Postgres enum alter-type friction.
-   - `signing_secret` & `previous_secret`: Supports zero-downtime secret rotation.
+   - `signing_secret` & `previous_secret`: Supports zero-downtime secret rotation. Application-layer encrypted via AES-256-GCM using `ENCRYPTION_KEY` and the endpoint UUID as GCM Additional Authenticated Data (AAD) (ADR 0004). Scrubbed to `NULL` upon soft deletion.
    - `previous_secret_expires_at`: Grace period deadline for old secret validation.
+   - `deleted_at`: Soft delete timestamp column (ADR 0005). Deletion sets `deleted_at = now()`, `status = 'disabled'`, and scrubs secrets to `NULL`.
+   - `version`: Monotonically increasing integer version for optimistic locking (`PATCH /v1/endpoints/:id`).
+   - **Worker Operational Invariant (Day 3 & Day 4)**: The Day 3 fan-out consumer and Day 4 delivery worker must strictly skip endpoints where `deleted_at IS NOT NULL` as well as paused or disabled ones (`WHERE deleted_at IS NULL AND status = 'active'`).
 4. **`events`**:
    - `raw_payload TEXT NOT NULL`: Preserves the exact bytes received over HTTP. HMAC-SHA256 signatures are computed exclusively over `raw_payload` (ADR 0002).
    - `payload JSONB NOT NULL`: Parsed JSON for indexing and inspection.
@@ -179,7 +182,9 @@ Every index in HookRelay is mapped directly to an operational query pattern:
 | `idx_api_keys_lookup` | `api_keys (key_prefix) WHERE revoked_at IS NULL` | `SELECT * FROM api_keys WHERE key_prefix = $1 AND revoked_at IS NULL;` | Partial index on active keys; provides single-lookup $O(1)$ auth check on every inbound API call while ignoring revoked keys. |
 | `idx_api_keys_tenant` | `api_keys (tenant_id, created_at DESC)` | `SELECT * FROM api_keys WHERE tenant_id = $1 ORDER BY created_at DESC;` | Invariant 6 compliance; allows tenant dashboard to list keys sorted by recency without table scans. |
 | `idx_endpoints_tenant_status` | `endpoints (tenant_id, status)` | `SELECT * FROM endpoints WHERE tenant_id = $1 AND status = 'active';` | Fan-out engine query; quickly locates active subscriber endpoints for a tenant during event publication. |
-| `idx_endpoint_subscriptions_match` | `endpoint_subscriptions (event_type, endpoint_id)` | `SELECT endpoint_id FROM endpoint_subscriptions WHERE event_type = $1 OR event_type = '*';` | Subscriber resolution query; finds which endpoints subscribe to an event type during fan-out. |
+| `idx_endpoints_tenant_list` | `endpoints (tenant_id, created_at DESC, id DESC) WHERE deleted_at IS NULL` | `SELECT * FROM endpoints WHERE tenant_id = $1 AND deleted_at IS NULL AND (created_at, id) < ($2, $3) ORDER BY created_at DESC, id DESC LIMIT $limit + 1;` | Keyset (cursor) pagination query; provides $O(\log n + \text{limit})$ B-tree index traversal ordered by microsecond timestamp and tie-broken by UUID under Invariant 6 isolation. |
+| `idx_endpoints_tenant_active` | `endpoints (tenant_id) WHERE deleted_at IS NULL AND status = 'active'` | `SELECT * FROM endpoints WHERE tenant_id = $1 AND deleted_at IS NULL AND status = 'active';` | Fan-out engine query; locates active subscriber endpoints for a tenant during event publication, skipping deleted/paused/disabled endpoints. |
+| `idx_endpoint_subscriptions_match` | `endpoint_subscriptions (event_type, endpoint_id)` | `SELECT endpoint_id FROM endpoint_subscriptions WHERE event_type = $1 OR event_type = '*';` | Subscriber resolution query; finds which endpoints subscribe to an event type during fan-out. Note: Lookups by `endpoint_id` (e.g. `GET /subscriptions`) are already served by `uq_endpoint_subscriptions (endpoint_id, event_type)`. |
 | `idx_events_tenant_created` | `events (tenant_id, created_at DESC)` | `SELECT * FROM events WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT $2;` | Invariant 6 compliance; paginated tenant event log inspection in API/dashboard. |
 | `idx_outbox_unpublished` | `outbox (created_at ASC) WHERE published_at IS NULL` | `SELECT event_id FROM outbox WHERE published_at IS NULL ORDER BY created_at ASC LIMIT $1 FOR UPDATE SKIP LOCKED;` | Outbox relay poller query (Invariant 2); partial index guarantees sub-millisecond lookups regardless of how many millions of historical events have already been published. |
 | `idx_deliveries_tenant_status_created` | `deliveries (tenant_id, status, created_at DESC)` | `SELECT * FROM deliveries WHERE tenant_id = $1 AND status = $2 ORDER BY created_at DESC LIMIT $3;` | Primary tenant delivery log query; matches equality filter on `tenant_id` and `status` and supplies pre-sorted order on `created_at DESC` without in-memory sort. |

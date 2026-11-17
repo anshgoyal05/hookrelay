@@ -48,6 +48,8 @@ export interface ApiDependencies {
   secretRotationGraceSeconds?: number;
   allowHttp?: boolean;
   allowPrivateTargets?: boolean;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  onRoute?: (routeOptions: any) => void;
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs = 2000): Promise<T> {
@@ -84,6 +86,10 @@ export function buildServer(dependencies: ApiDependencies) {
     },
     loggerInstance: logger,
   });
+
+  if (dependencies.onRoute) {
+    app.addHook("onRoute", dependencies.onRoute);
+  }
 
   // Inject X-Request-Id header on all responses
   app.addHook("onSend", async (request, reply) => {
