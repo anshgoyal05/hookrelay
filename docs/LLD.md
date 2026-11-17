@@ -250,3 +250,88 @@ Application-level URL validation and socket-level IP checks represent the first 
 - In production, the **true and non-negotiable backstop** is network-level egress control:
   - **Kubernetes NetworkPolicy / Calico**: Deny worker pod egress to private CIDRs (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local (`169.254.0.0/16`), and internal VPC service subnets.
   - **Cloud VPC / Firewall Rules**: Egress gateway or NAT instances restricting outbound traffic exclusively to the public Internet, with explicit drops on internal metadata endpoints (`169.254.169.254`, `168.63.129.16`).
+
+## 6. Authentication & Key Lifecycle Architecture
+
+### 6.1 Authentication Verification Flow
+All tenant-scoped API routes enforce authentication through `createApiKeyAuth`:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client as Tenant Client
+    participant Auth as Fastify createApiKeyAuth
+    participant PG as PostgreSQL (api_keys)
+    participant Redis as Redis (LastUsed Cache)
+    participant Handler as Route Handler
+
+    Client->>Auth: Bearer hr_live_<prefix>_<secret>
+    alt Format Invalid or Length > 200
+        Auth->>Auth: Perform dummy SHA-256 comparison
+        Auth-->>Client: 401 Unauthorized
+    else Valid Shape
+        Auth->>PG: SELECT id, tenant_id, key_hash, revoked_at FROM api_keys WHERE key_prefix = $1
+        alt Prefix Not Found
+            Auth->>Auth: Perform dummy timingSafeEqual comparison
+            Auth-->>Client: 401 Unauthorized
+        else Row Found
+            Auth->>Auth: crypto.timingSafeEqual(key_hash, sha256(secret))
+            alt Hash Mismatch or revoked_at IS NOT NULL
+                Auth-->>Client: 401 Unauthorized
+            else Active Key Validated
+                Auth->>Auth: Set request.tenantId and request.keyId
+                Auth->)Redis: Throttled usage record (<= 1 write/key/min)
+                Auth->>Handler: Proceed
+                Handler-->>Client: 200/201/204 Success
+            end
+        end
+    end
+```
+
+### 6.2 Key Security & Anti-Lockout Concurrency Guard
+- **Lookup by Prefix:** Plaintext 16-hex prefix provides $O(1)$ indexed lookup. The 256-bit secret is never stored or logged (Invariant 4) and is stored exclusively as a SHA-256 hash.
+- **Timing Attack Mitigation:** Designed to avoid timing variations by executing dummy constant-time comparisons when a key prefix is unknown or malformed.
+- **Race-Safe Anti-Lockout Guard:** A tenant cannot revoke its last remaining active key without `?force=true`. The check and revocation run inside a single transaction that first serializes writes on the parent tenant row:
+  ```sql
+  SELECT id FROM tenants WHERE id = $1 FOR UPDATE;
+  SELECT count(*)::int FROM api_keys WHERE tenant_id = $1 AND revoked_at IS NULL;
+  UPDATE api_keys SET revoked_at = now() WHERE id = $2 AND tenant_id = $1 AND revoked_at IS NULL;
+  ```
+
+## 7. Endpoint Domain Model & Cryptographic Lifecycle
+
+### 7.1 Data Structure & Cryptographic Binding
+- **Table Definition:** `endpoints` table includes `url`, `status`, `concurrency_limit`, `version`, `deleted_at`, `signing_secret`, `previous_secret`, and `previous_secret_expires_at`.
+- **GCM Additional Authenticated Data (AAD):** Signing secrets are encrypted with AES-256-GCM where the endpoint UUID is passed as AAD:
+  ```ts
+  cipher.setAAD(Buffer.from(endpointId, "utf8"));
+  ```
+  This cryptographically binds the ciphertext to that specific endpoint row, preventing database ciphertext swapping attacks between endpoints or tenants.
+- **Secret Format at Rest:** `v1:k1:<iv_hex>:<tag_hex>:<ciphertext_hex>`.
+- **Secret Scrubbing on Deletion:** Migration `0004` drops `NOT NULL` on `signing_secret`. Upon soft deletion (`DELETE /v1/endpoints/:id`), `signing_secret`, `previous_secret`, and `previous_secret_expires_at` are scrubbed to `NULL` to eliminate secret storage for decommissioned destinations.
+
+### 7.2 Keyset Pagination on `(created_at, id)`
+- Keyset cursor encodes `{ createdAt: string, id: string }` as opaque base64.
+- `created_at` is preserved as high-precision ISO-8601 text directly from Postgres (`to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`), preventing JavaScript `Date` truncation of microseconds.
+- Query evaluation:
+  ```sql
+  SELECT id, url, status, description, concurrency_limit,
+         to_char(created_at, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as created_at,
+         to_char(updated_at, 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as updated_at,
+         version
+  FROM endpoints
+  WHERE tenant_id = $1 AND deleted_at IS NULL
+    AND (created_at, id) < ($cursorCreatedAt::timestamptz, $cursorId::uuid)
+  ORDER BY created_at DESC, id DESC
+  LIMIT $limit + 1;
+  ```
+- **Performance:** $O(\log n + \text{limit})$ index scan supported by `idx_endpoints_tenant_list`.
+
+## 8. Known Limitations
+
+1. **Forward-Only Keyset Pagination:** Pagination cursors advance strictly forward; backward navigation is not supported.
+2. **Opaque Cursors:** Cursors must be passed unmodified as returned by the API; manual tampering or invalid base64 fails validation (HTTP 400).
+3. **Irreversible Soft Delete:** Deleting an endpoint disables delivery, removes all event subscriptions, and scrubs cryptographic secrets. Reactivation is not supported.
+4. **Single Previous Secret Window:** Rapid sequential secret rotations overwrite the intermediate previous secret. Only the most recent previous secret remains valid until expiration.
+5. **Advisory Registration-Time SSRF Check:** Registration URL validation catches immediate errors and private destinations, but delivery workers must re-validate the target IP upon DNS resolution at connection time (Day 4).
+6. **Usage Tracking Approximate Resolution:** Throttling `last_used_at` writes to Redis/Postgres at 1-minute intervals means timestamps indicate recent activity periods rather than exact per-request arrival times.

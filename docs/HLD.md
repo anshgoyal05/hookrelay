@@ -249,3 +249,82 @@ To keep HookRelay robust, secure, and focused on its core mission, the following
 4. **Synchronous Direct Dispatch:** Ingestion never dispatches HTTP calls synchronously within the `POST /events` request cycle. Doing so couples ingestion latency to external network conditions and violates Invariant 7.
 5. **Long-Term Cold Data Warehousing:** HookRelay is not a permanent data lake. Partitioned delivery logs older than 90 days are pruned or archived. Customers requiring multi-year compliance audits should stream delivery logs to cold storage (e.g., S3, BigQuery) via log export pipelines.
 6. **Bespoke SDK Code Generators:** We do not build or maintain client SDK generators. Standard HTTP clients and cryptographic HMAC libraries readily verify HookRelay deliveries in any programming language.
+
+---
+
+## 8. Authentication Architecture & Token Lifecycle
+
+HookRelay enforces strict tenant-scoped authentication across all management and ingestion endpoints (Invariant 6):
+
+### Authentication Sequence Diagram
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client as Tenant Backend / Dashboard
+    participant API as Fastify API (apps/api)
+    participant Auth as authMiddleware
+    participant PG as PostgreSQL (api_keys)
+    participant Redis as Redis (LastUsed Cache)
+
+    Client->>API: HTTP Request (Authorization: Bearer hr_live_<prefix>_<secret>)
+    API->>Auth: Validate Authorization header
+    alt Header Missing, Overlength, or Malformed Prefix
+        Auth->>Auth: Perform dummy SHA-256 comparison (Timing Defense)
+        Auth-->>Client: 401 Unauthorized (urn:hookrelay:problem:unauthorized)
+    else Structured Key Header Valid
+        Auth->>PG: SELECT id, tenant_id, key_hash, revoked_at FROM api_keys WHERE key_prefix = $1
+        alt Prefix Unknown (0 Rows)
+            Auth->>Auth: Perform dummy constant-time comparison (Timing Defense)
+            Auth-->>Client: 401 Unauthorized (urn:hookrelay:problem:unauthorized)
+        else Prefix Found in DB
+            Auth->>Auth: crypto.timingSafeEqual(key_hash, sha256(secret))
+            alt Hash Mismatch or revoked_at IS NOT NULL
+                Auth-->>Client: 401 Unauthorized (urn:hookrelay:problem:unauthorized)
+            else Valid, Active Key
+                Auth->>Auth: Attach request.tenantId and request.keyId
+                Auth->)Redis: Asynchronously update last_used_at (Throttled to <= 1/min)
+                Auth->>API: Proceed to tenant-scoped route handler
+                API-->>Client: 200/201/204 Success Response
+            end
+        end
+    end
+```
+
+### Key Lifecycle
+1. **Bootstrap Generation:** The root tenant and initial key are generated via `POST /v1/admin/tenants` (guarded by `ADMIN_TOKEN`).
+2. **Tenant Key Provisioning:** Tenants create additional keys via `POST /v1/api-keys`. High-entropy 256-bit secrets are generated with `hr_live_<16_hex_prefix>_<64_hex_secret>`. The plaintext secret is displayed strictly **once** and never stored.
+3. **Storage & Verification:** The 16-hex prefix is indexed for $O(1)$ lookups; the secret is stored exclusively as a SHA-256 hash. Authentication uses `crypto.timingSafeEqual`.
+4. **Throttled Usage Tracking:** To avoid database write exhaustion on every API tick, `last_used_at` updates are cached in Redis and throttled to at most once per minute per key.
+5. **Revocation & Anti-Lockout Guard:** Keys are soft-revoked via `DELETE /v1/api-keys/:id` (`revoked_at = now()`). A tenant cannot revoke its last remaining active key without explicitly providing `?force=true`, evaluated in an atomic transaction locking the tenant row.
+
+---
+
+## 9. Endpoint Resource Model & Secret Management
+
+### Resource Model
+- **Endpoint:** Represents a subscriber webhook destination URL.
+  - Fields: `id` (UUID), `tenant_id` (UUID), `url` (normalized HTTPS/HTTP href), `status` (`active`, `paused`, `disabled`), `description`, `concurrency_limit` (1–100), `version` (optimistic locking counter), `created_at`, `updated_at`, `deleted_at`.
+- **Signing Secrets:**
+  - Format: `whsec_` + 32 random bytes in base64.
+  - Encryption at Rest: AES-256-GCM using `ENCRYPTION_KEY` from the environment.
+  - Additional Authenticated Data (AAD): The endpoint UUID is bound as GCM AAD, preventing cross-row ciphertext substitution.
+  - Storage format: `v1:k1:<iv_hex>:<tag_hex>:<ciphertext_hex>`.
+- **Zero-Downtime Secret Rotation:**
+  - `POST /v1/endpoints/:id/rotate-secret` generates a new active secret returned once.
+  - The previous secret is retained in `previous_secret` with a configurable expiration window (`previous_secret_expires_at`, default 24h).
+  - Outbound delivery workers (Day 4) sign with both active and unexpired previous secrets during rotation windows.
+  - Rapid double-rotations overwrite the intermediate previous secret and refresh the expiration; no expired secret is ever retained.
+- **Subscriptions:**
+  - Managed via `PUT /v1/endpoints/:id/subscriptions` as an atomic set replacement.
+  - Supports validated free-form event types (`^[a-z0-9]{1,64}(\.[a-z0-9_-]{1,64})*$`) or wildcard (`*`). Wildcards cannot be mixed with specific event types.
+
+---
+
+## 10. Known Limitations
+
+1. **Forward-Only Keyset Pagination:** Keyset cursor pagination on endpoints operates strictly forward (`ORDER BY created_at DESC, id DESC`). Bidirectional or backward cursor traversal is not implemented.
+2. **Opaque Keyset Cursors:** Cursors encode `{ createdAt: string, id: string }` with microsecond precision directly from PostgreSQL. Modifying or decoding/re-encoding cursors client-side will trigger a validation error.
+3. **Irreversible Soft Deletion:** Deleting an endpoint (`DELETE /v1/endpoints/:id`) permanently disables delivery, scrubs all stored signing secrets to `NULL`, and drops subscriptions. Soft-deleted endpoints cannot be reactivated; a new endpoint must be created.
+4. **Single Previous Secret Window:** Secret rotation supports exactly one previous active secret during the grace window. If a tenant executes two rotations in rapid succession, only the latest previous secret remains valid.
+5. **Advisory Registration-Time URL Validation:** URL validation at endpoint registration defends against immediate misconfigurations and initial SSRF attempts. However, due to DNS rebinding and TTL expiry, connect-time validation in delivery workers (Day 4) is mandatory.
+6. **Usage Timestamp Granularity:** Because `last_used_at` updates for API keys are throttled to once per minute via Redis/memory, recorded timestamps reflect approximate activity windows rather than exact per-request arrival times.
