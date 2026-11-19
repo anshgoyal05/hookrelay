@@ -168,18 +168,59 @@ erDiagram
    - `tenant_id` denormalized for direct tenant-scoped filtering.
    - `response_snippet` capped at 1024 bytes (`CHECK (octet_length(response_snippet) <= 1024)`).
 
-### The Declarative Partitioning "Default Partition" Pitfall
-In PostgreSQL declarative range partitioning, adding a `DEFAULT` catch-all partition creates a severe operational hazard:
-- When a `DEFAULT` partition exists, creating or attaching any new monthly partition requires PostgreSQL to acquire an `ACCESS EXCLUSIVE` lock on the parent table and sequentially scan the entire `DEFAULT` partition to verify that no existing rows fall within the new partition's range.
-- If clock drift or anomalies have already inserted rows matching the new range into `DEFAULT`, the `CREATE TABLE ... PARTITION OF` statement will immediately fail. Fixing it requires manually detaching, updating, and reattaching the default partition while blocking incoming writes.
-- **HookRelay's Solution**: HookRelay omits the default partition and relies on proactive automated monthly partition generation via `create_attempts_partition(target_month)`. The migration creates the current and next 3 months dynamically, and a scheduled worker task extends partitions monthly ahead of time.
+### Declarative Partitioning & The Default Partition Architecture
+In PostgreSQL 16 declarative range partitioning (`PARTITION BY RANGE (started_at)`), HookRelay uses a hybrid approach:
+1. **Automated Monthly Partition Generation**: Proactive automated monthly partitions are generated ahead of time via `create_attempts_partition(target_month)`. The initial migration generates 4 forward months, and a scheduled maintenance job generates future months.
+2. **Safety Net (Default Partition)**: Migration 0005 adds `delivery_attempts_default` as a safety net catch-all. If historical backfills, out-of-order retries, or clock skew cause a delivery attempt to fall outside pre-generated monthly partitions, the row is safely captured rather than aborting the transaction.
+3. **Monitoring View**: `view_delivery_attempts_default_monitor` reports `row_count`, `oldest_started_at`, and `newest_started_at` in the default partition so operators can trigger re-partitioning when rows land there.
+
+#### Safe Procedure for Moving Rows Out of the Default Partition
+To migrate rows from `delivery_attempts_default` into a newly dedicated monthly partition without data corruption:
+1. **Create Standalone Table with Matching Schema and Constraints**:
+   ```sql
+   CREATE TABLE delivery_attempts_2025_01 (LIKE delivery_attempts INCLUDING ALL);
+   ALTER TABLE delivery_attempts_2025_01 ADD CONSTRAINT check_started_at
+     CHECK (started_at >= '2025-01-01 00:00:00+00' AND started_at < '2025-02-01 00:00:00+00');
+   ```
+2. **Drain Rows in Bounded Batches**:
+   Drain rows from `delivery_attempts_default` into the standalone table in bounded batches to avoid transaction log exhaustion and lock contention:
+   ```sql
+   WITH batch AS (
+     DELETE FROM delivery_attempts_default
+     WHERE started_at >= '2025-01-01 00:00:00+00'
+       AND started_at < '2025-02-01 00:00:00+00'
+     LIMIT 5000
+     RETURNING *
+   )
+   INSERT INTO delivery_attempts_2025_01 SELECT * FROM batch;
+   ```
+3. **Attach Partition & PostgreSQL 16 Locking Behavior**:
+   ```sql
+   ALTER TABLE delivery_attempts ATTACH PARTITION delivery_attempts_2025_01
+     FOR VALUES FROM ('2025-01-01 00:00:00+00') TO ('2025-02-01 00:00:00+00');
+   ```
+   > [!IMPORTANT]
+   > **PostgreSQL 16 Lock Levels During ATTACH PARTITION**:
+   > Per official PostgreSQL 16 documentation (*Table 13.2 / ALTER TABLE*):
+   > - `SHARE UPDATE EXCLUSIVE` lock is acquired on the **parent partitioned table** (`delivery_attempts`).
+   > - `ACCESS EXCLUSIVE` lock is acquired on the **table being attached** (`delivery_attempts_2025_01`).
+   > - `ACCESS EXCLUSIVE` lock is acquired on the **default partition** (`delivery_attempts_default`).
+   >
+   > An `ACCESS EXCLUSIVE` lock on `delivery_attempts_default` conflicts with all lock modes and blocks all concurrent `SELECT`, `INSERT`, `UPDATE`, and `DELETE` queries on that default partition until the transaction finishes.
+   > Furthermore, attaching a partition triggers a scan of the default partition to verify no rows overlap the new partition's range. While this scan can be avoided if a suitable `CHECK` constraint exists on the default partition, PostgreSQL **still acquires the `ACCESS EXCLUSIVE` lock** on the default partition. If any row within that range lands in the default partition before `ATTACH` executes, the statement fails.
+
+#### Retention Policy Limitation
+The Day 7 automated data retention job cleans up historical attempt logs by executing `DROP TABLE delivery_attempts_YYYY_MM`. It **cannot** expire, truncate, or drop rows that landed in `delivery_attempts_default`. Any rows stored in the default partition must be drained or pruned manually.
+
+#### Migration Numbering
+Migration `0002` is intentionally unused and reserved/skipped in the migration sequence.
 
 ### Index Justification & Query Mapping
 Every index in HookRelay is mapped directly to an operational query pattern:
 
 | Index Name | Table & Columns | Target Query | Rationale |
 | :--- | :--- | :--- | :--- |
-| `idx_api_keys_lookup` | `api_keys (key_prefix) WHERE revoked_at IS NULL` | `SELECT * FROM api_keys WHERE key_prefix = $1 AND revoked_at IS NULL;` | Partial index on active keys; provides single-lookup $O(1)$ auth check on every inbound API call while ignoring revoked keys. |
+| `api_keys_key_prefix_key` (UNIQUE) | `api_keys (key_prefix)` | `SELECT * FROM api_keys WHERE key_prefix = $1 AND revoked_at IS NULL;` | Unique constraint index; serves $O(1)$ single-row key authentication lookups by prefix. (Note: redundant partial index `idx_api_keys_lookup` was dropped in Migration 0005). |
 | `idx_api_keys_tenant` | `api_keys (tenant_id, created_at DESC)` | `SELECT * FROM api_keys WHERE tenant_id = $1 ORDER BY created_at DESC;` | Invariant 6 compliance; allows tenant dashboard to list keys sorted by recency without table scans. |
 | `idx_endpoints_tenant_status` | `endpoints (tenant_id, status)` | `SELECT * FROM endpoints WHERE tenant_id = $1 AND status = 'active';` | Fan-out engine query; quickly locates active subscriber endpoints for a tenant during event publication. |
 | `idx_endpoints_tenant_list` | `endpoints (tenant_id, created_at DESC, id DESC) WHERE deleted_at IS NULL` | `SELECT * FROM endpoints WHERE tenant_id = $1 AND deleted_at IS NULL AND (created_at, id) < ($2, $3) ORDER BY created_at DESC, id DESC LIMIT $limit + 1;` | Keyset (cursor) pagination query; provides $O(\log n + \text{limit})$ B-tree index traversal ordered by microsecond timestamp and tie-broken by UUID under Invariant 6 isolation. |
