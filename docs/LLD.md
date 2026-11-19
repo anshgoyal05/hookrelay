@@ -376,3 +376,27 @@ sequenceDiagram
 4. **Single Previous Secret Window:** Rapid sequential secret rotations overwrite the intermediate previous secret. Only the most recent previous secret remains valid until expiration.
 5. **Advisory Registration-Time SSRF Check:** Registration URL validation catches immediate errors and private destinations, but delivery workers must re-validate the target IP upon DNS resolution at connection time (Day 4).
 6. **Usage Tracking Approximate Resolution:** Throttling `last_used_at` writes to Redis/Postgres at 1-minute intervals means timestamps indicate recent activity periods rather than exact per-request arrival times.
+
+## 9. Decisions Deferred
+
+The following architectural decisions and edge-case remediations are explicitly deferred to subsequent implementation days:
+
+### 9.1 Retry Due-Time Index Status Coverage (Day 5)
+- **Context**: The `deliveries` table tracks delivery lifecycle through `status` (`pending`, `in_flight`, `succeeded`, `failed`, `dead`) and schedules redeliveries using `next_attempt_at`.
+- **Current Index**: `idx_deliveries_due_retry` is indexed on `(next_attempt_at ASC) WHERE status = 'failed'`.
+- **Deferred Decision**: Whether the due-time index must expand to cover other non-terminal statuses (e.g., `pending` or timed-out `in_flight` rows) depends on the retry scheduler architecture chosen in Day 5:
+  - *Option 1*: A database polling sweeper (`SELECT ... WHERE status = 'failed' AND next_attempt_at <= now() FOR UPDATE SKIP LOCKED`), requiring indexes covering all polled statuses.
+  - *Option 2*: RabbitMQ delayed message exchange (`rabbitmq_delayed_message_exchange`) or dead-letter message TTL, where retries live in the broker and the database index is only consulted during reconciliation sweeps.
+
+### 9.2 Fan-Out Crash Recovery & "Pending" Delivery Sweeper (Day 3)
+- **Risk**: In Day 3, the fan-out consumer receives an `outbox` event, inserts `deliveries` rows with `status = 'pending'`, and publishes dispatch messages to RabbitMQ. If the worker crashes or loses connectivity after the database transaction commits but before all RabbitMQ dispatch messages are acknowledged by the broker, those deliveries will remain stuck in `pending` indefinitely.
+- **Deferred Decision**: Mechanism to resolve un-dispatched `pending` rows:
+  - *Option A*: RabbitMQ message redelivery with idempotent delivery insertion (`ON CONFLICT (event_id, endpoint_id) DO UPDATE ...`).
+  - *Option B*: A lightweight background sweeper job querying `SELECT * FROM deliveries WHERE status = 'pending' AND created_at < now() - INTERVAL '2 minutes'` to re-enqueue orphaned dispatches.
+
+### 9.3 Soft-Delete Invariant on Fan-Out & Delivery Paths (Day 3 & Day 4)
+- **Invariant**: The fan-out consumer (Day 3) and HTTP delivery worker (Day 4) must strictly skip endpoints where `deleted_at IS NOT NULL`.
+- **Enforcement**:
+  - The fan-out query explicitly enforces `WHERE e.tenant_id = $1 AND e.status = 'active' AND e.deleted_at IS NULL AND s.event_type IN ($2, '*')`.
+  - The delivery worker must re-verify that `deleted_at IS NULL` prior to socket connection to prevent race conditions where an endpoint was deleted while its dispatch message was in flight in RabbitMQ.
+

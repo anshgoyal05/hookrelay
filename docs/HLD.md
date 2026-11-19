@@ -42,22 +42,29 @@ HookRelay solves these challenges as a dedicated, multi-tenant outbound webhook 
 - **Total Deliveries/Day:** $10\text{M} \times 3 = 30,000,000\text{ deliveries/day}$
 - **Latency Target:** First-attempt p95 delivery latency $\le 2.0\text{s}$
 
-### Explicit Assumptions
-> [!NOTE] Assumed Traffic Profile & Sizing Model
-> 1. **Diurnal Peak Window:** Traffic is not uniformly distributed over 24 hours ($86,400\text{s}$). We assume $70\%$ of daily events arrive during an $8\text{-hour}$ peak window ($28,800\text{s}$).
-> 2. **Payload Size:** Average raw JSON payload size is $2\text{ KB}$; maximum allowed payload size is $64\text{ KB}$.
-> 3. **Success & Retry Distribution:**
->    - $95\%$ of deliveries succeed on the first attempt ($28.5\text{M}$ attempts).
->    - $5\%$ fail and enter retry queues ($1.5\text{M}$ deliveries).
->    - Retried deliveries average $2.5$ additional attempts before succeeding or exhausting retries $\approx 3.75\text{M}$ retry attempts.
->    - Total daily delivery attempts $\approx 30\text{M} + 3.75\text{M} \approx 33.75\text{M}\text{ attempts/day}$.
-> 4. **External Endpoint Latency:** External destination servers respond with a p50 latency of $250\text{ms}$ and p95 latency of $1,500\text{ms}$. Hard outbound timeout is capped at $5.0\text{s}$.
+### Explicit Assumptions (Unmeasured Model Inputs)
+> [!NOTE] Unmeasured Assumptions
+> - **Peak Concentration Ratio (70% in 8-hour window):** We assume 70% of daily event volume arrives within an 8-hour peak business window (28,800 seconds). This 70% fraction and 8-hour window are unmeasured assumptions.
+> - **Payload Size:** Average raw JSON payload size is $2\text{ KB}$; maximum allowed payload size is $256\text{ KB}$ (Day 3 events route).
+> - **Retry Overhead Rate (12.5% of deliveries):** We assume retry attempts equal 12.5% of total deliveries (e.g. 5% failure rate averaging 2.5 attempts before terminal success or dead-lettering, generating 3.75M retries/day across 30M deliveries). This 12.5% retry rate is an unmeasured assumption.
+> - **External Endpoint Latency:** External destination servers respond with a p50 latency of $250\text{ms}$ and p95 latency of $1,500\text{ms}$. Hard outbound timeout is capped at $5.0\text{s}$.
 
-### Calculated Throughput
-- **Average Ingestion Rate:** $10,000,000 / 86,400 \approx 116\text{ events/sec}$
-- **Peak Ingestion Rate:** $(10,000,000 \times 0.70) / 28,800 \approx 243\text{ events/sec}$
-- **Average Delivery Dispatch Rate:** $116 \times 3 \approx 348\text{ deliveries/sec}$
-- **Peak Delivery Dispatch Rate:** $243 \times 3 \approx 730\text{ deliveries/sec}$ (first attempts) $+ \approx 90\text{ retries/sec} \approx 820\text{ total outbound HTTP req/sec}$.
+### Calculated Throughput & Derivation (820 req/s Peak)
+The peak dispatch capacity of HookRelay is derived directly from the parameters and assumptions above:
+1. **Total Daily Deliveries:**
+   $$10\text{M events/day} \times \text{fan-out } 3 = 30\text{M deliveries/day}$$
+2. **Peak Ingestion Rate:**
+   Assuming 70% of daily traffic arrives within an 8-hour peak window ($28,800\text{ s}$):
+   $$\frac{7\text{M events}}{28,800\text{ s}} \approx 243\text{ events/s}$$
+3. **Peak First-Attempt Dispatch Rate:**
+   $$243\text{ events/s} \times \text{fan-out } 3 = 729\text{ first attempts/s}$$
+4. **Peak Retry Rate:**
+   Retries are assumed at 12.5% of deliveries ($3.75\text{M retries/day}$). Assuming 70% of retries also execute within the peak window:
+   $$\frac{3.75\text{M} \times 0.70}{28,800\text{ s}} = \frac{2,625,000}{28,800\text{ s}} \approx 91.1\text{ retries/s} \approx \text{about } 91\text{/s}$$
+5. **Total Peak Outbound Delivery Throughput:**
+   $$729\text{ first attempts/s} + 91\text{ retries/s} \approx \text{about } 820\text{/s (HTTP req/s)}$$
+
+During peak load, HookRelay must sustain approximately **820 outbound HTTP req/s** across its worker pool while transitioning delivery lifecycle rows (`deliveries` status: `pending` $\to$ `in_flight` $\to$ `succeeded` / `failed` / `dead`, with `next_attempt_at` backoff scheduling).
 
 ### Network Bandwidth
 - **Inbound Ingestion Bandwidth:**
