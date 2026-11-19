@@ -34,17 +34,8 @@ Docs: docs/HLD.md, docs/LLD.md, docs/adr/NNNN-title.md, docs/RUNBOOK.md
 - Prefer boring, well-known solutions. Explain any non-obvious choice in 2 to 3 sentences.
 - Never run destructive commands (rm -rf outside the repo, docker system prune, git push --force).
 
-## Custom Commands
-### /verify
-Run lint, typecheck, unit tests and integration tests. Summarize failures with file:line.
-Fix only what is related to the current task. Report anything unrelated without fixing it.
-
-### /adr
-Ask me for the decision topic. Then draft docs/adr/NNNN-<slug>.md with: Context, Options
-considered (at least 3), Decision, Consequences, and "What would make us revisit this".
-Leave a section "My reasoning" empty for me to fill in.
-
-### /day-review
-Review today's diff against AGENTS.md invariants. List: (1) violations, (2) missing tests,
-(3) missing docs, (4) security risks, (5) 3 interview questions this code could generate,
-with short model answers.
+## Custom Commands (Workflows)
+HookRelay provides project-specific Antigravity workflows in `.agents/workflows/`:
+- `/verify`: See [.agents/workflows/verify.md](file://.agents/workflows/verify.md) (Runs lint, typecheck, test suites, and formats failures as `file:line`).
+- `/adr`: See [.agents/workflows/adr.md](file://.agents/workflows/adr.md) (Guides drafting a new ADR in `docs/adr/NNNN-<slug>.md`).
+- `/day-review`: See [.agents/workflows/day-review.md](file://.agents/workflows/day-review.md) (Audits git diff against architectural invariants, tests, docs, security, and interview questions).
