@@ -761,7 +761,11 @@ export const endpointRoutes: FastifyPluginAsync<EndpointRoutesOptions> = async (
   // 9. PUT /v1/endpoints/:id/subscriptions - Atomically replace subscription set
   fastify.put(
     "/v1/endpoints/:id/subscriptions",
-    { preHandler: apiKeyAuth },
+    {
+      preHandler: apiKeyAuth,
+      // 32 KB route-level body limit protects against unbounded array allocations (GHSA-mrhx-c7xc-m3w5)
+      bodyLimit: 32768,
+    },
     async (request: FastifyRequest, reply: FastifyReply) => {
       const paramsResult = EndpointParamsSchema.safeParse(request.params);
       if (!paramsResult.success) {

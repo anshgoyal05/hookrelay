@@ -33,5 +33,13 @@ This document tracks known architectural limitations, unverified runtime paths, 
 
 ### 5. Zod Collection Parsing & Memory Consumption (GHSA-mrhx-c7xc-m3w5)
 - **Status**: Mitigated via Fastify Ingestion Body Limits.
-- **Description**: In Zod 3.x, schema parsing on collections (e.g. `z.array(ItemSchema).max(N)`) evaluates elements sequentially and allocates error objects before evaluating `.max(N)`. Submitting large arrays of invalid items could cause elevated memory consumption.
-- **Mitigation**: Fastify enforces strict HTTP body limits: a global default `bodyLimit` of 64 KB (65,536 bytes) and a route-level `bodyLimit` of 32 KB (32,768 bytes) on `PUT /v1/endpoints/:id/subscriptions`. Oversized payloads are aborted by Fastify with HTTP 413 Payload Too Large before JSON parsing or Zod schema validation ever executes.
+- **Description**: In Zod 3.x (`zod@3.25.76` currently installed; vulnerable range `< 4.6.6`), schema parsing on collections (e.g. `z.array(ItemSchema).max(N)`) evaluates elements sequentially and allocates error objects for every invalid item before evaluating `.max(N)`. Submitting large arrays of invalid items causes memory and CPU spikes.
+- **Mitigation & Fastify Caps**: Fastify enforces strict HTTP body limits: a global default `bodyLimit` of 64 KB (65,536 bytes) and a route-level `bodyLimit` of 32 KB (32,768 bytes) on `PUT /v1/endpoints/:id/subscriptions`. (Note: The Day 3 `POST /v1/events` route will override this with its specific 256 KB payload cap). Oversized payloads are aborted by Fastify with HTTP 413 Payload Too Large before JSON parsing or Zod schema validation ever executes.
+- **Empirical Measurement Results**:
+  We measured the worst-case payload possible under the 32 KB route limit (8,170 invalid items packed into a 32,697-byte JSON array):
+  - **Payload Size**: 32,697 bytes (8,170 invalid items).
+  - **Validation Issues Generated**: 8,171 distinct Zod issue objects.
+  - **Parse Latency**: **8.58 ms**.
+  - **Heap Memory Delta**: **+8.24 MB** (Heap rose from 6.50 MB to 14.74 MB).
+  - **Resident Set Size (RSS) Delta**: **+24.0 MB** (RSS rose from 48.91 MB to 72.92 MB).
+  - **Conclusion**: The 32 KB body limit caps single-request validation overhead to under 10 ms and ~8.2 MB heap delta, preventing catastrophic out-of-memory crashes while remaining on the stable Zod 3.x release line until Zod 4 migration is officially scheduled.

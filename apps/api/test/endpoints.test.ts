@@ -1078,5 +1078,52 @@ describe("apps/api - Endpoint Management API (CRUD & Lifecycle)", () => {
       expect(logsCombined.includes(base64Part)).toBe(false);
       expect(logsCombined.includes(rotBase64Part)).toBe(false);
     });
+
+    it("enforces route-level bodyLimit on subscriptions: rejects payloads exceeding 32 KB with HTTP 413", async () => {
+      const createRes = await testApp.inject({
+        method: "POST",
+        url: "/v1/endpoints",
+        headers: { authorization: `Bearer ${tenantAApiKey}` },
+        payload: { url: "https://example.com/webhook-oversize" },
+      });
+      const endpoint = createRes.json();
+
+      // Generate a payload exceeding 32 KB (~45 KB of JSON)
+      const oversizedPayload = {
+        event_types: Array.from({ length: 1500 }, (_, i) => `order.created.event.${i}`),
+      };
+      const jsonString = JSON.stringify(oversizedPayload);
+      expect(Buffer.byteLength(jsonString)).toBeGreaterThan(32768);
+
+      const res = await testApp.inject({
+        method: "PUT",
+        url: `/v1/endpoints/${endpoint.id}/subscriptions`,
+        headers: {
+          authorization: `Bearer ${tenantAApiKey}`,
+          "content-type": "application/json",
+        },
+        payload: jsonString,
+      });
+
+      expect(res.statusCode).toBe(413);
+    });
+
+    it("enforces global default bodyLimit (64 KB): rejects general endpoint bodies exceeding 64 KB with HTTP 413", async () => {
+      const hugeDescription = "x".repeat(70000);
+      const res = await testApp.inject({
+        method: "POST",
+        url: "/v1/endpoints",
+        headers: {
+          authorization: `Bearer ${tenantAApiKey}`,
+          "content-type": "application/json",
+        },
+        payload: JSON.stringify({
+          url: "https://example.com/webhook",
+          description: hugeDescription,
+        }),
+      });
+
+      expect(res.statusCode).toBe(413);
+    });
   });
 });

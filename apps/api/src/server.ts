@@ -85,6 +85,9 @@ export function buildServer(dependencies: ApiDependencies) {
       return typeof headerReqId === "string" ? headerReqId : randomUUID();
     },
     loggerInstance: logger,
+    // 64 KB default request body limit to protect against unbounded parser allocations.
+    // Note: Day 3 POST /v1/events route will override this at route level with its 256 KB payload cap.
+    bodyLimit: 65536,
   });
 
   if (dependencies.onRoute) {
