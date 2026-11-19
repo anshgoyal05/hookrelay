@@ -7,6 +7,9 @@
     "apps/*",
     "packages/*"
   ],
+  "engines": {
+    "node": ">=24.0.0"
+  },
   "scripts": {
     "dev:api": "npm run dev --workspace=@hookrelay/api",
     "dev:worker": "npm run dev --workspace=@hookrelay/worker",
@@ -20,7 +23,7 @@
     "test:watch": "vitest",
     "up": "docker compose -f infra/docker-compose.yml up -d",
     "down": "docker compose -f infra/docker-compose.yml down",
-    "migrate": "tsx --env-file=.env packages/shared/src/db/migrate.ts",
+    "migrate": "tsx --env-file-if-exists=.env packages/shared/src/db/migrate.ts",
     "verify": "npm run lint && npm run typecheck && npm run test"
   },
   "devDependencies": {

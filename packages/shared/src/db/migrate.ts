@@ -1,12 +1,12 @@
 import pg from "pg";
-import { loadConfig } from "../config.js";
+import { loadDatabaseConfig } from "../config.js";
 import { createLogger } from "../logger.js";
 import { runMigrations } from "./migrator.js";
 
 const logger = createLogger({ name: "hookrelay-migrate-cli" });
 
 async function main(): Promise<void> {
-  const config = loadConfig();
+  const config = loadDatabaseConfig();
 
   logger.info("Connecting to PostgreSQL to run migrations...");
   const client = new pg.Client({
