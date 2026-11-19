@@ -23,8 +23,10 @@ describe("apps/api - 25 Cross-Tenant & Security Access Attempts Matrix", () => {
   let revokedKeyA: string;
 
   beforeAll(async () => {
-    const baseConnStr =
-      process.env.DATABASE_URL || "postgres://postgres:postgres@localhost:5432/hookrelay";
+    const baseConnStr = process.env.DATABASE_URL;
+    if (!baseConnStr) {
+      throw new Error("DATABASE_URL environment variable is required to run database integration tests");
+    }
     const url = new URL(baseConnStr);
 
     mainPool = new pg.Pool({ connectionString: baseConnStr });

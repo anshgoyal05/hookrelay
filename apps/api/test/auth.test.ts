@@ -20,8 +20,10 @@ describe("apps/api - Authentication & Tenant Bootstrap", () => {
 
   beforeAll(async () => {
     // 1. Connect to PostgreSQL to create a throwaway database
-    const baseConnStr =
-      process.env.DATABASE_URL || "postgres://postgres:postgres@localhost:5432/hookrelay";
+    const baseConnStr = process.env.DATABASE_URL;
+    if (!baseConnStr) {
+      throw new Error("DATABASE_URL environment variable is required to run database integration tests");
+    }
     const url = new URL(baseConnStr);
     const _dbNameToConnect = url.pathname.slice(1) || "postgres";
 

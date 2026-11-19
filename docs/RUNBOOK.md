@@ -31,11 +31,11 @@ npm run dev:worker
 ## 2. Infrastructure Services
 | Service | Image | Local Port | Healthcheck | Credentials / Path |
 | :--- | :--- | :--- | :--- | :--- |
-| **PostgreSQL** | `postgres:16-alpine` | `5432` | `pg_isready -U postgres` | `postgres:postgres` / `hookrelay` |
-| **Redis** | `redis:7-alpine` | `6379` | `redis-cli ping` | Default (no auth in dev) |
-| **RabbitMQ** | `rabbitmq:3-management-alpine` | `5672` (AMQP)<br>`15672` (UI) | `rabbitmq-diagnostics -q ping` | `guest:guest` |
+| **PostgreSQL** | `postgres:16-alpine` | `127.0.0.1:5433` (maps to internal 5432) | `pg_isready -U postgres` | `postgres:postgres` / `hookrelay` |
+| **Redis** | `redis:7-alpine` | `127.0.0.1:6380` (maps to internal 6379) | `redis-cli ping` | Default (no auth in dev) |
+| **RabbitMQ** | `rabbitmq:3-management-alpine` | `127.0.0.1:5673` (AMQP)<br>`127.0.0.1:15673` (UI) | `rabbitmq-diagnostics -q ping` | `guest:guest` |
 
-RabbitMQ Management Dashboard: [http://localhost:15672](http://localhost:15672)
+RabbitMQ Management Dashboard: [http://localhost:15673](http://localhost:15673)
 
 ## 3. Operational Checks & Troubleshooting
 
